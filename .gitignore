@@ -1,0 +1,16 @@
+# API Keys and Secrets
+.env
+
+# Databases (Proprietary Trading Data)
+*.db
+*.sqlite
+*.sqlite3
+
+# Execution Logs
+*.log
+sys.log
+
+# Python Environments and Cache
+venv/
+__pycache__/
+*.pyc
