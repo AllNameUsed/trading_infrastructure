@@ -14,3 +14,11 @@ sys.log
 venv/
 __pycache__/
 *.pyc
+
+# Ignore everything inside the strategies folder
+strategies/*
+
+# Whitelist only the structural and mock files
+!strategies/base.py
+!strategies/mock_strat.py
+!strategies/__init__.py
