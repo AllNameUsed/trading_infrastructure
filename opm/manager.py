@@ -99,7 +99,7 @@ class OpenPositionManager:
                 should_exit, exit_reason = self._independent_risk_check(pos, event.params)
 
             if should_exit:
-                await self._trigger_exit(pos, exit_reason)
+                await self._trigger_exit(pos, exit_reason, event.params)
 
     def _independent_risk_check(self, pos: Position, params: MarketParams) -> Tuple[bool, str]:
         """Placeholder: trailing stop / take-profit / time-stop math goes here."""
@@ -107,7 +107,7 @@ class OpenPositionManager:
             return True, "OPM Independent RNG Check triggered."
         return False, ""
 
-    async def _trigger_exit(self, pos: Position, reason: str) -> None:
+    async def _trigger_exit(self, pos: Position, reason: str, params: MarketParams) -> None:
         if pos.side is None:
             return
         intent = Intent(
@@ -119,6 +119,7 @@ class OpenPositionManager:
             order_type=OrderType.MARKET,
             quantity=abs(pos.quantity),
             reason=reason,
+            reference_price=params.latest_bar.close,
         )
         if not self.lock.try_begin_exit(intent):
             return

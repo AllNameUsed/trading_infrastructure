@@ -1,6 +1,6 @@
 # Trading System Skeleton — Architecture & Reconstruction Manual
 
-Oct 5, 2026 · @Jerry — **v2, revised Oct 10, 2026** to describe the implemented MVP
+Oct 5, 2026 · @Jerry — **v2, revised Oct 10, 2026** to describe the implemented MVP · **schema v3, Oct 11, 2026**: trade journal and sub-lot residual ("dust") carry (§8.1, §8.2)
 
 This document plus the class docstrings in the code are the complete description of the system. Read it top to bottom and you can rebuild every package: what each box is, which types flow between the boxes, the order things happen in, which component owns which piece of state, and why each trade-off was made. The v1 design (the architecture diagram in `Design Document.pdf` and the original skeleton) is still the soul of the project; where the implementation departed from it, the departure and its reason are written down here (§3, §15).
 
@@ -23,7 +23,7 @@ trading_infrastructure/
 │
 ├── messages/                      # THE ARROWS — imported by everyone, imports nothing
 │   ├── model.py                   #   nouns: Bar, MarketParams, Intent, OrderRequest, Fill,
-│   │                              #          OrderSnapshot, VenueOrderUpdate, Position, enums
+│   │                              #          OrderSnapshot, VenueOrderUpdate, Position, TradeRecord, enums
 │   ├── events.py                  #   verbs: BarClosed, ParamsReady, IntentIssued/Rejected,
 │   │                              #          Order* lifecycle, Position*, RiskBreach, ...
 │   └── instruments.py             #   InstrumentSpec + InstrumentRegistry (tick/lot rounding, filters)
@@ -63,15 +63,16 @@ trading_infrastructure/
 │       └── venue.py               #     SimulatedVenue: matching engine on live mainnet quotes
 │
 ├── state/                         # BLUE: Persistent State
-│   ├── schema.sql                 #   tables (schema v2, epoch-ms timestamps)
+│   ├── schema.sql                 #   tables (schema v3, epoch-ms timestamps)
 │   ├── stores.py                  #   SqliteStore: single-writer repository
-│   └── portfolio.py               #   PortfolioManager: per-strategy ledgers (single writer)
+│   └── portfolio.py               #   PortfolioManager: per-strategy ledgers + trade journal (single writer)
 │
 ├── ops/                           # BLUE: support services
 │   └── journal.py                 #   DatabaseJournal: audit trail
 │
 ├── tools/
-│   └── audit_db.py                # offline DB inspection / kline continuity audit
+│   ├── audit_db.py                # offline DB inspection / kline continuity audit
+│   └── reconcile_trades.py        # rebuilds every trade from the fills and checks the journal
 └── tests/                         # unittest suite (no network): python -m unittest discover -s tests -t .
 ```
 
@@ -123,6 +124,7 @@ trading_infrastructure/
 | Routing is per strategy (`STRATEGY_REGISTRY`) | Promotion path SIM → small LIVE → full LIVE | Ledgers/reconciliation must stay per mode |
 | Binance fills by **polling** (`query` + `myTrades`) | Simple and robust on both testnet and live | Add a user-data stream when latency matters |
 | Quote stream **bypasses the bus** | bookTicker/aggTrade run at hundreds of msgs/s per symbol; the bus is the critical path | — |
+| Sub-lot residuals ("dust") are **carried on the ledger**, not sized away by predicting fees | Rounding makes dust unavoidable whatever the fee; fees vary by tier, BNB, promotion, maker/taker and venue (§8.1) | Residuals are not rehydrated after a restart yet (§14) |
 | Floats in the domain, **Decimal at the exchange boundary** | Simplicity; rounding is where float error bites | Move ledgers to Decimal/int ticks before real size |
 | Spot semantics (no shorting) | The venue is Binance Spot | Futures needs a new venue and margin model |
 | Placeholder features/exits use RNG | MVP plumbing soak test | Replace with `data/features.py` and `opm/engines.py` |
@@ -159,7 +161,7 @@ Handlers are resolved over the event's class hierarchy (MRO), so subscribing to 
 
 | Event | Payload | Publisher | Consumers | Priority |
 |---|---|---|---|---|
-| `BarClosed` | `bar: Bar`, `replay` | BinanceFeed | DataProcessor, store, SimulatedVenue | NORMAL |
+| `BarClosed` | `bar: Bar`, `replay` | BinanceFeed | DataProcessor, store, SimulatedVenue, Portfolio (MAE/MFE of open trades) | NORMAL |
 | `ParamsReady` | `params: MarketParams`, `replay` | DataProcessor | OPM (−10), strategies (0), telemetry (100) | NORMAL |
 | `IntentIssued` | `intent: Intent` | strategies (OPEN), OPM (CLOSE) | Journal, Lock (audit), OMS | NORMAL / HIGH for exits |
 | `IntentRejected` | `intent, stage: RejectStage, rule_name, reason` | OMS | Lock, Journal | HIGH |
@@ -168,7 +170,7 @@ Handlers are resolved over the event's class hierarchy (MRO), so subscribing to 
 | `OrderPartiallyFilled` / `OrderFilled` | `order`, `fill: Fill` | OMS | Portfolio, Lock | HIGH |
 | `OrderCanceled` / `OrderExpired` / `OrderRejected` | `order`, `reason` | OMS | Lock | HIGH |
 | `OrderStatusUnknown` | `order`, `reason` | OMS | Lock (stays pending) | HIGH |
-| `PositionOpened` / `PositionChanged` / `PositionClosed` | `position: Position` (+ delta / realized PnL) | PortfolioManager | Lock, OPM | HIGH |
+| `PositionOpened` / `PositionChanged` / `PositionClosed` | `position: Position` (+ delta / realized PnL; on close `position.residual_quantity` is the sub-lot leftover) | PortfolioManager | Lock, OPM | HIGH |
 | `RiskBreach` | `rule_name, symbol, detail` | OMS (vanished order) | Journal | CRITICAL |
 | `SignalGenerated`, `ResizeRequest`, `KillSwitch`, `Heartbeat` | — | *planned* | — | — |
 
@@ -193,6 +195,7 @@ stateDiagram-v2
 - **Who may act:** IDLE = the strategy may enter. HOLDING = the OPM may exit. PENDING_* = nobody may act.
 - **Settling** happens only on terminal facts. The resting state is then *derived*: a position exists → HOLDING; working orders remain → PENDING_ENTRY; otherwise → IDLE. Position truth comes from `PortfolioManager.get_position` (rule 5).
 - **`OrderStatusUnknown` never settles**, so the strategy cannot double-enter while an order's fate is unknown.
+- **"Flat" means below one lot step.** A sub-lot residual left by fees never holds the lock (§8.1).
 
 ### Order lifecycle — owned by the OMS (`messages/model.OrderStatus`, `execution/oms._apply_update`)
 
@@ -227,7 +230,7 @@ How the OMS decides the effective status on each venue update:
 
 ### 6.1 Startup (`main.main`)
 1. `settings.validate()`: fail loudly if a LIVE or TESTNET strategy lacks keys.
-2. `SqliteStore.start()`: create or verify schema v2 (WAL) and launch the writer task.
+2. `SqliteStore.start()`: create or verify schema v3 (WAL) and launch the writer task. A file from an older schema aborts startup.
 3. `load_instruments()`: mainnet `exchangeInfo` → `InstrumentRegistry` (falls back to `default_spec`).
 4. Build the venues (`SimulatedVenue` always; `BinanceVenue` per TESTNET/LIVE mode in use) and the `VenueRouter`.
 5. Build the core: `DatabaseJournal`, `PortfolioManager`, `LockManager(position_view=portfolio.get_position)`, `DataProcessor`, `OpenPositionManager`, `PreTradeRiskManager(rules)`, `OrderManagementSystem`, strategies. Abort if any strategy id is missing from `STRATEGY_REGISTRY`.
@@ -273,7 +276,7 @@ In the OMS, a CLOSE intent:
 - cancels the strategy's resting entry orders;
 - runs only the risk rules with `applies_to_exits=True`.
 
-When the fill arrives, the portfolio sees the ledger go flat and publishes `PositionClosed` with PnL net of fees. The lock settles to IDLE.
+When the fill arrives, the portfolio sees the ledger drop below one lot step. It values any sub-lot residual at the fill price and carries it (§8.1), finalizes the `trades` row (§8.2), and publishes `PositionClosed` with PnL net of fees. The lock settles to IDLE.
 
 ### 6.4 Rejection anywhere
 Registry, routing, validation, risk or an exception → `IntentRejected(stage)` → the lock settles (back to IDLE for entries, back to HOLDING for exits) and the journal writes a `risk_ledger` row. A venue refusal produces `OrderRejected` with the same effect on the lock.
@@ -321,7 +324,8 @@ frozen Bar             symbol, venue, interval, start_time, close_time, open, hi
 frozen MarketParams    symbol, latest_bar: Bar, features: Mapping[str,float] (read-only), volatility_estimate
 frozen Signal          strategy_id, symbol, side, probability, features_snapshot, model_version, signal_id   (planned)
 frozen Intent          strategy_id, symbol, venue, kind, side, order_type, quantity, price?, stop_price?,
-                       time_in_force, reason, intent_id (correlation id), signal_id?, created_at
+                       time_in_force, reason, reference_price? (decision price, stamped by BaseStrategy / OPM),
+                       intent_id (correlation id), signal_id?, created_at
 frozen CancelIntent    strategy_id, symbol, client_order_id, reason
 frozen OrderRequest    client_order_id, symbol, venue, side, order_type, quantity, price?, stop_price?, time_in_force
                        (rounded; the ONLY thing a venue receives)
@@ -333,8 +337,12 @@ frozen OrderSnapshot   client_order_id, strategy_id, mode, intent, request, stat
 frozen VenueOrderUpdate client_order_id, status, venue_order_id?, fills: tuple[Fill], cumulative_filled_quantity?,
                        reason, timestamp            (port return type; fills may repeat)
 frozen Position        strategy_id, symbol, venue, mode, quantity (SIGNED), average_entry_price,
-                       realized_pnl (net of fees), fees_paid, protective_order_id?, opened_at, updated_at
+                       realized_pnl (net of fees), fees_paid, protective_order_id?, opened_at, updated_at,
+                       trade_id?, residual_quantity (PositionClosed only)
                        + side (derived), + is_flat
+frozen TradeRecord     one `trades` row: identity, direction, status, entry/exit qty + VWAP, max_quantity,
+                       carried_in_* / residual_*, gross/fees/realized PnL, entry/exit time + intent,
+                       exit_reason, entry/exit_ref_price, mae, mfe   + holding_ms   (§8.2)
 frozen PositionView    quantity, average_entry_price, bars_held      (planned, for Strategy.manage)
 + utc_now() -> aware UTC datetime        + new_id() -> uuid4 hex
 ```
@@ -444,7 +452,8 @@ class WarmupLoader(store, source, interval, recovery_hours)
 
 ```text
 abstract class BaseStrategy(bus, lock_manager, strategy_id, symbols)   «sub» ParamsReady(order 0)  «pub» IntentIssued
-  + on_params_ready(e)   own symbol -> not replay -> lock IDLE -> analyze -> try_begin_entry -> publish
+  + on_params_ready(e)   own symbol -> not replay -> lock IDLE -> analyze -> stamp reference_price
+                         (bar close) -> try_begin_entry -> publish
   # analyze_opportunity(params) -> Intent | None      ← the only thing a strategy implements
 class MockStrat          5%/bar random-side MARKET 0.01
 ```
@@ -501,17 +510,21 @@ class VenueRouter      + register(venue) / venue_for(mode) / all()
 ### 7.9 `state/` and `ops/`
 
 ```text
-class SqliteStore(db_path, schema_path, max_batch=500)      single writer task, WAL, schema v2
+class SqliteStore(db_path, schema_path, max_batch=500)      single writer task, WAL, schema v3
   + start / stop (flushes) / flush
-  + save_bar(s) / upsert_order(snap, durable) / record_fill / save_position / log_intent /
-    resolve_intent / log_risk_event
+  + save_bar(s) / upsert_order(snap, durable) / record_fill / save_position / save_trade /
+    link_trade_fill / log_intent / resolve_intent / log_risk_event
   + get_recent_bars / get_bar_start_times / get_latest_bar_time
 + to_ms(aware dt) / from_ms(ms)       exception SchemaMismatchError
 
-class PortfolioManager(bus, instruments, store?)    «sub» OrderPartiallyFilled, OrderFilled (order -50)
-  - _positions: Dict[(sid, sym), Position]     + global_metrics, strategy_metrics: PerformanceMetrics
+class PortfolioManager(bus, instruments, store?)    «sub» OrderPartiallyFilled, OrderFilled (order -50), BarClosed
+  - _ledgers: Dict[(sid, sym), Position]       every ledger INCLUDING sub-lot residuals (§8.1)
+  - _trades: Dict[(sid, sym), _OpenTrade]      the trade open on each ledger (§8.2)
+  + global_metrics, strategy_metrics: PerformanceMetrics
   «pub» PositionOpened / PositionChanged / PositionClosed
-  + apply_fill(order_snapshot, fill)   + get_position / get_open_positions / net_quantity / get_strategy_metrics
+  + apply_fill(order_snapshot, fill)   splits a flip-through-zero fill into two legs (two trades)
+  + get_position (None below one lot step) / get_open_positions / get_residual / net_quantity (incl. residuals)
+  + get_strategy_metrics
 class PerformanceMetrics    total_closed, winners, losers, gross_profit, gross_loss  + win_rate, avg_winner, avg_loser
 
 class DatabaseJournal(bus, store)   «sub» IntentIssued(-200), IntentRejected, RiskBreach
@@ -521,13 +534,14 @@ class DatabaseJournal(bus, store)   «sub» IntentIssued(-200), IntentRejected, 
 - **settings:** constants (§11) plus `validate()`.
 - **main:** `load_instruments()`, `main()`, `shutdown()`. Construction order is §6.1.
 - **tools/audit_db.py:** read-only row counts and kline continuity (`python -m tools.audit_db [hours]`).
+- **tools/reconcile_trades.py:** rebuilds every trade from the fills and checks the journal (`python -m tools.reconcile_trades [db]`, exit code 1 on failure; §8.2).
 - **tests:** see §12.
 
 ---
 
-## 8. Persistence (`state/schema.sql`, schema version 2)
+## 8. Persistence and accounting (`state/schema.sql`, schema version 3)
 
-Every timestamp is **INTEGER epoch milliseconds (UTC)**. `PRAGMA user_version = 2`. An older file aborts startup with `SchemaMismatchError` (archive it and restart).
+Every timestamp is **INTEGER epoch milliseconds (UTC)**. `PRAGMA user_version = 3`. An older file aborts startup with `SchemaMismatchError` (archive it and restart).
 
 | Table | Key | Writer | Contents |
 |---|---|---|---|
@@ -535,10 +549,61 @@ Every timestamp is **INTEGER epoch milliseconds (UTC)**. `PRAGMA user_version = 
 | `intents` | intent_id | Journal inserts; OMS sets `outcome` | every decision + `ORDERED` / `REJECTED:<stage>` |
 | `orders` | client_order_id | **OMS only** | full order row; `version` guard prevents regressions |
 | `fills` | (client_order_id, exchange_trade_id) | OMS | immutable executions (`INSERT OR IGNORE`) |
-| `positions` | (strategy_id, symbol, opened_at) | **PortfolioManager only** | one row per position lifetime, OPEN → CLOSED |
+| `positions` | (strategy_id, symbol, opened_at) | **PortfolioManager only** | one row per position lifetime, OPEN → CLOSED; `trade_id` links to `trades` |
 | `risk_ledger` | autoincrement | Journal | `REJECT_INTENT:<stage>` and `BREACH` rows |
+| `trades` | trade_id | **PortfolioManager only** | the historical journal: one row per round trip (§8.2) |
+| `trade_fills` | (trade_id, client_order_id, exchange_trade_id) | **PortfolioManager only** | which fill (or fill leg) belongs to which trade |
 
-The full story of a trade is reconstructable by joining on `intent_id`: intents → orders → fills, with positions matched on (strategy, symbol, time).
+The full story of a trade is reconstructable by joining on ids: `trades` → `trade_fills` → `fills` → `orders` → `intents` (on `intent_id`), and `positions` on `trade_id`.
+
+### 8.1 Sub-lot residuals ("dust") and how the system manages them
+
+**Where dust comes from.** Binance Spot (without BNB fee payment) charges the fee in the asset you *receive*. On a buy that is the base asset: buying 0.01 ETH at 0.1 % leaves 0.00999 ETH in the account. Every order quantity must be a whole multiple of the lot step (0.0001 ETH), so the exit can sell at most 0.0099 ETH, and 0.00009 ETH is left over. Before schema v3 the portfolio treated that leftover as zero: the ledger said "flat" while the venue still held it, and it grew by 0.00009 ETH with every round trip (0.00153 ETH after the 17 trades of the 2026-10-10 soak test).
+
+**Why we don't size it away.** Even with perfect knowledge of the fee, the received quantity `q·(1−f)` lands on a lot-step multiple only when `q·f` is itself a whole number of steps. At 0.1 % that means ETH sizes in multiples of 0.1 ETH and BTC sizes in multiples of 0.01 BTC. Fees also change with VIP tier, the BNB discount, promotions and maker/taker status, and they differ per venue. So the ledger never predicts fees: **fees are facts read from each fill.**
+
+**What the system does: carry the residual, never discard it** (`state/portfolio.py`).
+1. A ledger below one lot step is **flat for trading**. `get_position()` returns `None`, `PositionClosed` is published, the lock goes IDLE, the OPM stops managing it, and the OMS refuses to exit it.
+2. The leftover **stays on the ledger**. At close it is valued at the closing fill price, and that value is part of the trade's realized PnL, so each trade's PnL is economically complete: realized = cash moved + residual × exit price.
+3. The **next trade starts from it** (`carried_in_qty`, `carried_in_price`). Its exit sells everything held, rounded down to the step, so what is left is again below one step: 0.00009 + 0.00999 = 0.01008 held → sell 0.0100 → carry 0.00008.
+
+The result:
+- The residual on every ledger stays **below one lot step forever**. It never accumulates.
+- Each ledger equals what its fills put into the account, so the sum of ledgers reconciles with the venue balance (`tests/test_trades.py`).
+- It works for any fee rate, fee asset and venue. Where fees never touch the base asset (fees in quote, futures), the residual is simply always zero.
+
+**Limits.**
+- Residuals live in memory, and a restart forgets them (part of the planned restart rehydration, §14). In SIM the venue's balances reset as well, so nothing is lost. On LIVE, up to one lot step per ledger becomes untracked per restart. `tools/reconcile_trades.py` reports these breaks as warnings.
+- Fees charged in a third asset (e.g. BNB) can't be valued and are excluded from PnL with a warning. Paying fees in BNB removes base-asset fees on buys, and with them the dust, but treat it as a cost choice for LIVE, not something correctness relies on: if the BNB balance runs out, Binance silently goes back to charging the received asset.
+- Fee *estimates* still belong in pre-trade sizing and risk (a conservative rate per venue). They never enter the ledger.
+
+### 8.2 The trade journal (`trades`, `trade_fills`)
+
+`positions` is live state, and on close it zeroes quantity and entry price. `trades` is the historical journal: one row per round trip (`TradeRecord`), written only by the PortfolioManager, updated on every fill and finalized on close.
+
+- **Boundaries.** A trade opens with the first fill applied while no trade is open on its ledger, and closes when the ledger drops below one lot step.
+- **Columns.**
+  - Identity: `trade_id`, strategy, symbol, venue, mode, `direction` (LONG/SHORT), `status` (OPEN/CLOSED).
+  - Size: `entry_qty`, `exit_qty` (gross filled quantities), `max_quantity` (largest holding).
+  - Prices: `avg_entry_price`, `avg_exit_price` (VWAPs of the fills).
+  - Dust: `carried_in_qty`/`_price`, `residual_qty`/`_price` (§8.1).
+  - Money, in quote currency: `gross_pnl`, `fees_paid`, `realized_pnl` = gross − fees, residual included.
+  - Time: `entry_time`, `exit_time`, `holding_ms`.
+  - Causes: `entry_intent_id`, `exit_intent_id`, `exit_reason`.
+  - Research: `entry_ref_price`/`exit_ref_price` are the bar close each decision was made on, so slippage = fill VWAP − reference price. `mae`/`mfe` are the worst and best price excursion per unit vs `avg_entry_price` (mae ≤ 0 ≤ mfe), at bar resolution: the fills plus the bars that started after entry.
+- **Links.** `trade_fills` ties every fill to its trade. A fill that flips a position through zero (impossible on spot, possible on futures) is split into a closing leg and an opening leg, each with its share of quantity and fee. `positions.trade_id` ties each position lifetime to its trade.
+- **Verification.** `python -m tools.reconcile_trades [db]` rebuilds every trade from the fills with independent cash-flow arithmetic, and checks attribution, quantities, VWAPs, PnL, inventory and the residual chain. Run it after every soak run.
+
+```sql
+-- per-strategy scorecard
+SELECT strategy_id, COUNT(*) AS trades, AVG(realized_pnl > 0) AS win_rate, SUM(realized_pnl) AS net_pnl,
+       AVG(holding_ms) / 60000.0 AS avg_minutes_held
+FROM trades WHERE status = 'CLOSED' GROUP BY strategy_id;
+
+-- entry slippage per unit, signed so that positive = worse than the decision price
+SELECT trade_id, (avg_entry_price - entry_ref_price) * CASE direction WHEN 'LONG' THEN 1 ELSE -1 END AS slippage
+FROM trades WHERE entry_ref_price IS NOT NULL;
+```
 
 ---
 
@@ -591,7 +656,7 @@ A Binance-Spot-like matching engine driven by live mainnet `bookTicker` and `agg
 
 ## 12. Testing
 
-Run with `python -m unittest discover -s tests -t .`. The suite needs no network and runs in about 1.5 s.
+Run with `python -m unittest discover -s tests -t .`. The suite needs no network and runs in about 4 s.
 
 | File | Proves |
 |---|---|
@@ -599,6 +664,7 @@ Run with `python -m unittest discover -s tests -t .`. The suite needs no network
 | `test_bus_and_lock.py` | priority + FIFO ordering, `order=` and base-class dispatch, stop sentinel, handler isolation; lock exclusivity, rollback, exit gating |
 | `test_pipeline.py` | full round trip with exact net-of-fees PnL; registry/risk/venue rejections release the lock; reduce-only; immutable per-fill snapshots; write-ahead and epoch-ms persistence; **lock transitions exactly IDLE→PENDING_ENTRY→HOLDING→PENDING_EXIT→IDLE**; timeout → UNKNOWN → reconciled (both outcomes) |
 | `test_sim_venue.py` | queue position, aggressor side, price improvement, IOC/FOK, book walking + consumed liquidity, filters/balances/duplicates, stop slippage, cancel releases funds, stale-data refusal, bar-only mode |
+| `test_trades.py` | **dust carry**: residual kept, valued and flat for trading; the next trade absorbs it and the ledger equals the venue balance across 15 round trips; trade rows (VWAPs, reference prices, MAE/MFE); a flip-through-zero fill split across two trades; `reconcile_trades` passes and catches a tampered row |
 | `test_market_data.py` | REST never returns the forming candle; backfill is replay and deduplicated; processor dedupe + replay propagation + read model; a burst of bars yields exactly one entry |
 
 Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys needed) and inspect the results with `tools/audit_db.py`.
@@ -632,7 +698,7 @@ Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys neede
 | RiskSupervisor + KillSwitch | `risk/supervisor.py` | polls venues directly, persisted halt flag, cancel-all + flatten |
 | Exit engines + ExitContext | `opm/engines.py`, `opm/context.py` | Bracket, TrailingATR, Hysteresis, SafetyNet, StrategyDirected, Composite; replace the RNG in the OPM |
 | Feature library | `data/features.py` | pure functions + `FeatureSpec` declarations per strategy |
-| Restart rehydration | main startup | rebuild open orders, positions and lock state from the store + venue truth |
+| Restart rehydration | main startup | rebuild open orders, positions (incl. sub-lot residuals, §8.1), open trades and lock state from the store + venue truth |
 | Binance user-data stream | `connectors/binance/user_stream.py` | replace polling; push via `set_update_handler` |
 | Telegram + Watchdog | `ops/telegram.py`, `ops/watchdog.py` | alerts, `/halt`, heartbeat staleness |
 | Decimal ledgers | `state/portfolio.py` | exact reconciliation against venue balances |
@@ -656,3 +722,4 @@ Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys neede
 | `RiskBreach` for every rejection | `IntentRejected` for routine rejections; `RiskBreach` for real breaches | a kill switch must not fire on a normal "no" |
 | Exits subject to every risk rule | `applies_to_exits` opt-in | never block a risk-reducing order with an entry rule |
 | Fixed-format prices (`:.2f`) | tick/lot rounding via the registry | works for any symbol's filters |
+| Positions zeroed on close, sub-lot leftovers discarded | `trades` + `trade_fills` journal; residuals carried on the ledger (schema v3) | a historical record per trade; ledger = venue balance (§8.1, §8.2) |

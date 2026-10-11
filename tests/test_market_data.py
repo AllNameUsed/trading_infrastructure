@@ -11,7 +11,7 @@ from connectors.binance.rest import BinanceMarketDataREST
 from data.processor import DataProcessor
 from messages.events import BarClosed, IntentIssued, ParamsReady
 from messages.model import Bar
-from opm.lock import LockManager
+from opm.lock import LockManager, LockState
 from strategies.base import BaseStrategy
 from tests.helpers import intent
 
@@ -104,6 +104,9 @@ class MarketDataTests(unittest.IsolatedAsyncioTestCase):
         bus.stop()
         await task
         self.assertEqual(len(intents), 1)
+        # The decision price is stamped for slippage analysis, and the lock still owns that intent.
+        self.assertIsNotNone(intents[0].intent.reference_price)
+        self.assertIs(lock.state("TEST_STRAT", "BTCUSDT"), LockState.PENDING_ENTRY)
 
 
 if __name__ == "__main__":

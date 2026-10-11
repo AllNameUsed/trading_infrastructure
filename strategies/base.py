@@ -6,6 +6,7 @@ replay guard and lock acquisition, so concrete strategies only implement
 `analyze_opportunity`.
 """
 
+import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
@@ -25,7 +26,8 @@ class BaseStrategy(ABC):
     Publishes:   IntentIssued(kind=OPEN)
     Depends on:  LockManager
     on_params_ready flow: own symbol? -> not replay? -> lock IDLE? -> analyze_opportunity()
-        -> lock.try_begin_entry(intent) (atomic, AFTER the await) -> publish
+        -> stamp reference_price (the close it decided on) -> lock.try_begin_entry(intent)
+        (atomic, AFTER the await) -> publish
     Subclass contract:
         analyze_opportunity(params) -> Intent | None    the whole job; must be stateless
         w.r.t. market data (read params.features, never keep price arrays).
@@ -57,6 +59,9 @@ class BaseStrategy(ABC):
         intent = await self.analyze_opportunity(params)
         if intent is None:
             return
+        if intent.reference_price is None:
+            # The price the decision was made on: journaled on the trade for slippage analysis.
+            intent = dataclasses.replace(intent, reference_price=params.latest_bar.close)
 
         # Atomic acquisition AFTER the await: state may have changed while we were inferring.
         if not self.lock.try_begin_entry(intent):

@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS positions (
     protective_order_id TEXT,
     opened_at           INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL,
+    trade_id            TEXT,          -- -> trades.trade_id
     PRIMARY KEY (strategy_id, symbol, opened_at)
 );
 
@@ -101,3 +102,55 @@ CREATE TABLE IF NOT EXISTS risk_ledger (
     action_taken TEXT NOT NULL,
     detail       TEXT NOT NULL
 );
+
+-- 7. Trades: the historical journal, one row per round trip (single writer: the PortfolioManager)
+--    A trade ends when its ledger drops below one lot step. Any sub-lot leftover ("dust") is
+--    valued at the closing price (residual_*) and carried into the next trade (carried_in_*).
+--    realized_pnl = gross_pnl - fees_paid, quote currency.
+CREATE TABLE IF NOT EXISTS trades (
+    trade_id         TEXT PRIMARY KEY,
+    strategy_id      TEXT    NOT NULL,
+    symbol           TEXT    NOT NULL,
+    venue            TEXT    NOT NULL,
+    mode             TEXT    NOT NULL,
+    direction        TEXT    NOT NULL,   -- LONG / SHORT
+    status           TEXT    NOT NULL,   -- OPEN / CLOSED
+    entry_qty        REAL    NOT NULL,   -- gross filled quantity, entry side
+    exit_qty         REAL    NOT NULL,   -- gross filled quantity, exit side
+    max_quantity     REAL    NOT NULL,   -- largest |holding| during the trade
+    avg_entry_price  REAL    NOT NULL,   -- VWAP of entry fills
+    avg_exit_price   REAL,               -- VWAP of exit fills
+    carried_in_qty   REAL    NOT NULL DEFAULT 0,
+    carried_in_price REAL    NOT NULL DEFAULT 0,
+    residual_qty     REAL    NOT NULL DEFAULT 0,
+    residual_price   REAL,
+    gross_pnl        REAL    NOT NULL,
+    fees_paid        REAL    NOT NULL,
+    realized_pnl     REAL    NOT NULL,
+    entry_time       INTEGER NOT NULL,
+    exit_time        INTEGER,
+    holding_ms       INTEGER,
+    num_fills        INTEGER NOT NULL,
+    entry_intent_id  TEXT    NOT NULL,
+    exit_intent_id   TEXT,
+    exit_reason      TEXT,
+    entry_ref_price  REAL,               -- decision-time price -> entry slippage
+    exit_ref_price   REAL,
+    mae              REAL    NOT NULL DEFAULT 0,   -- per unit vs avg_entry_price, <= 0
+    mfe              REAL    NOT NULL DEFAULT 0    -- per unit vs avg_entry_price, >= 0
+);
+CREATE INDEX IF NOT EXISTS idx_trades_strategy_time ON trades(strategy_id, entry_time);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol_time ON trades(symbol, entry_time);
+
+-- 8. Trade <-> fill links (single writer: the PortfolioManager)
+--    Every fill belongs to exactly one trade, except a fill that flips a position through
+--    zero: it is split into two legs, one per trade. quantity/fee are this leg's share.
+CREATE TABLE IF NOT EXISTS trade_fills (
+    trade_id          TEXT    NOT NULL,
+    client_order_id   TEXT    NOT NULL,
+    exchange_trade_id TEXT    NOT NULL,
+    quantity          REAL    NOT NULL,
+    fee               REAL    NOT NULL,
+    PRIMARY KEY (trade_id, client_order_id, exchange_trade_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_fills_fill ON trade_fills(client_order_id, exchange_trade_id);

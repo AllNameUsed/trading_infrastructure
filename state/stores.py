@@ -29,11 +29,11 @@ from typing import Iterable, List, Optional, Tuple
 
 import aiosqlite
 
-from messages.model import Bar, Fill, Intent, OrderSnapshot, Position
+from messages.model import Bar, Fill, Intent, OrderSnapshot, Position, TradeRecord
 
 logger = logging.getLogger("SqliteStore")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 _WriteItem = Tuple[str, tuple, Optional[asyncio.Future]]
@@ -69,6 +69,8 @@ class SqliteStore:
         upsert_order(snapshot, durable)   OMS only; version-guarded (never moves backwards)
         record_fill(fill)                 INSERT OR IGNORE by (client_order_id, trade id)
         save_position(pos, status)        PortfolioManager only; keyed by (sid, sym, opened_at)
+        save_trade(record)                PortfolioManager only; trades upsert by trade_id
+        link_trade_fill(...)              PortfolioManager only; trade_fills (one row per fill leg)
         log_intent / resolve_intent       Journal inserts, OMS resolves ORDERED / REJECTED:<stage>
         log_risk_event                    risk_ledger rows (rejections, breaches)
     Reads (separate short-lived connections; startup only):
@@ -113,8 +115,8 @@ class SqliteStore:
                 (has_tables,) = await cur.fetchone()  # type: ignore[misc]
             if has_tables and version != SCHEMA_VERSION:
                 raise SchemaMismatchError(
-                    f"{self.db_path} was created by an older schema (user_version={version}). "
-                    f"Rename/archive it and restart; schema v{SCHEMA_VERSION} uses epoch-ms timestamps."
+                    f"{self.db_path} was created by schema v{version}, this build needs v{SCHEMA_VERSION}. "
+                    f"Archive the file (it holds your history) and restart to create a fresh one."
                 )
             with open(self.schema_path, "r", encoding="utf-8") as f:
                 await db.executescript(f.read())
@@ -238,15 +240,51 @@ class SqliteStore:
     async def save_position(self, pos: Position, status: str) -> None:
         await self._write(
             """INSERT INTO positions (strategy_id, symbol, mode, status, quantity, average_entry_price,
-                   realized_pnl, fees_paid, protective_order_id, opened_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   realized_pnl, fees_paid, protective_order_id, opened_at, updated_at, trade_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(strategy_id, symbol, opened_at) DO UPDATE SET
                  status=excluded.status, quantity=excluded.quantity,
                  average_entry_price=excluded.average_entry_price, realized_pnl=excluded.realized_pnl,
                  fees_paid=excluded.fees_paid, protective_order_id=excluded.protective_order_id,
-                 updated_at=excluded.updated_at""",
+                 updated_at=excluded.updated_at, trade_id=excluded.trade_id""",
             (pos.strategy_id, pos.symbol, pos.mode.value, status, pos.quantity, pos.average_entry_price,
-             pos.realized_pnl, pos.fees_paid, pos.protective_order_id, to_ms(pos.opened_at), to_ms(pos.updated_at)),
+             pos.realized_pnl, pos.fees_paid, pos.protective_order_id, to_ms(pos.opened_at), to_ms(pos.updated_at),
+             pos.trade_id),
+        )
+
+    async def save_trade(self, t: TradeRecord) -> None:
+        await self._write(
+            """INSERT INTO trades (trade_id, strategy_id, symbol, venue, mode, direction, status,
+                   entry_qty, exit_qty, max_quantity, avg_entry_price, avg_exit_price,
+                   carried_in_qty, carried_in_price, residual_qty, residual_price,
+                   gross_pnl, fees_paid, realized_pnl, entry_time, exit_time, holding_ms, num_fills,
+                   entry_intent_id, exit_intent_id, exit_reason, entry_ref_price, exit_ref_price, mae, mfe)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(trade_id) DO UPDATE SET
+                 direction=excluded.direction, status=excluded.status,
+                 entry_qty=excluded.entry_qty, exit_qty=excluded.exit_qty, max_quantity=excluded.max_quantity,
+                 avg_entry_price=excluded.avg_entry_price, avg_exit_price=excluded.avg_exit_price,
+                 residual_qty=excluded.residual_qty, residual_price=excluded.residual_price,
+                 gross_pnl=excluded.gross_pnl, fees_paid=excluded.fees_paid, realized_pnl=excluded.realized_pnl,
+                 exit_time=excluded.exit_time, holding_ms=excluded.holding_ms, num_fills=excluded.num_fills,
+                 exit_intent_id=excluded.exit_intent_id, exit_reason=excluded.exit_reason,
+                 entry_ref_price=excluded.entry_ref_price, exit_ref_price=excluded.exit_ref_price,
+                 mae=excluded.mae, mfe=excluded.mfe""",
+            (t.trade_id, t.strategy_id, t.symbol, t.venue, t.mode.value, t.direction, t.status,
+             t.entry_qty, t.exit_qty, t.max_quantity, t.avg_entry_price, t.avg_exit_price,
+             t.carried_in_qty, t.carried_in_price, t.residual_qty, t.residual_price,
+             t.gross_pnl, t.fees_paid, t.realized_pnl, to_ms(t.entry_time),
+             to_ms(t.exit_time) if t.exit_time else None, t.holding_ms, t.num_fills,
+             t.entry_intent_id, t.exit_intent_id, t.exit_reason, t.entry_ref_price, t.exit_ref_price,
+             t.mae, t.mfe),
+        )
+
+    async def link_trade_fill(self, trade_id: str, fill: Fill) -> None:
+        """`fill` is the leg attributed to this trade (a flip-through-zero fill arrives as two legs)."""
+        await self._write(
+            """INSERT OR IGNORE INTO trade_fills (trade_id, client_order_id, exchange_trade_id, quantity, fee)
+               VALUES (?, ?, ?, ?, ?)""",
+            (trade_id, fill.client_order_id, fill.exchange_trade_id, fill.quantity, fill.fee),
         )
 
     async def log_intent(self, intent: Intent) -> None:

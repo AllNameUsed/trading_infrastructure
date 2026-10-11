@@ -270,6 +270,8 @@ class Intent:
       stop_price    required for STOP types
       intent_id     correlation id linking Intent -> Order -> Fill -> Position rows
       signal_id     link back to the Signal that motivated it (planned)
+      reference_price  the price the decision was made on (the bar close the strategy/OPM saw);
+                    stamped by BaseStrategy / the OPM, journaled on the trade for slippage analysis
     """
     strategy_id: str
     symbol: str
@@ -282,6 +284,7 @@ class Intent:
     stop_price: Optional[float] = None
     time_in_force: TimeInForce = TimeInForce.GTC
     reason: str = ""
+    reference_price: Optional[float] = None
     intent_id: str = field(default_factory=new_id)
     signal_id: Optional[str] = None
     created_at: datetime = field(default_factory=utc_now)
@@ -411,6 +414,10 @@ class Position:
       realized_pnl          quote units, NET of fees, accumulated since opened_at
       fees_paid             quote units (base-asset fees valued at the fill price)
       protective_order_id   PLANNED: the resting stop guarding this position
+      trade_id              the `trades` row this position lifetime belongs to
+      residual_quantity     PositionClosed only: the sub-lot leftover (< one lot step, "dust")
+                            still held on this ledger; it is carried into the next trade
+    Includes any carried-in residual: `quantity` is what the account really holds.
     """
     strategy_id: str
     symbol: str
@@ -423,6 +430,8 @@ class Position:
     protective_order_id: Optional[str] = None
     opened_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    trade_id: Optional[str] = None
+    residual_quantity: float = 0.0
 
     @property
     def side(self) -> Optional[OrderSide]:
@@ -435,6 +444,66 @@ class Position:
     @property
     def is_flat(self) -> bool:
         return self.quantity == 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TradeRecord:
+    """
+    One round trip on one ledger (strategy_id, symbol): the historical journal row
+    (`trades` table). Built and written only by the PortfolioManager.
+
+    A trade starts with the first fill applied while no trade is open and ends when
+    the ledger drops below one lot step. Quantities are base units, prices and
+    money are quote units.
+      direction                   "LONG" / "SHORT"
+      entry_qty / exit_qty        gross filled quantity on the entry / exit side
+      avg_entry_price / _exit_    VWAP of those fills (None until there is an exit fill)
+      max_quantity                largest |holding| during the trade
+      carried_in_qty / _price     sub-lot residual inherited from the previous trade, and
+                                  the price it was carried at (that trade's last exit price)
+      residual_qty / _price       sub-lot residual left at close, valued at the closing price
+      gross_pnl / fees_paid / realized_pnl   realized = gross - fees; includes the residual
+                                  valued at residual_price
+      entry/exit_ref_price        decision-time price of the opening / closing intent
+      mae / mfe                   max adverse / favourable excursion per unit vs avg_entry_price
+                                  (bar resolution: fills + bars that started after entry);
+                                  mae <= 0 <= mfe
+    """
+    trade_id: str
+    strategy_id: str
+    symbol: str
+    venue: str
+    mode: ExecutionMode
+    direction: str
+    status: str                       # OPEN / CLOSED
+    entry_qty: float
+    exit_qty: float
+    max_quantity: float
+    avg_entry_price: float
+    avg_exit_price: Optional[float]
+    carried_in_qty: float
+    carried_in_price: float
+    residual_qty: float
+    residual_price: Optional[float]
+    gross_pnl: float
+    fees_paid: float
+    realized_pnl: float
+    entry_time: datetime
+    exit_time: Optional[datetime]
+    num_fills: int
+    entry_intent_id: str
+    exit_intent_id: Optional[str]
+    exit_reason: Optional[str]
+    entry_ref_price: Optional[float]
+    exit_ref_price: Optional[float]
+    mae: float
+    mfe: float
+
+    @property
+    def holding_ms(self) -> Optional[int]:
+        if self.exit_time is None:
+            return None
+        return int((self.exit_time - self.entry_time).total_seconds() * 1000)
 
 
 @dataclass(frozen=True, slots=True)
