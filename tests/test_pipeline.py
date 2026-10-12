@@ -161,6 +161,7 @@ class _FlakyVenue:
     venue_id = "BINANCE"
     mode = ExecutionMode.TESTNET
     needs_polling = True
+    survives_restart = True
 
     def __init__(self, exists: bool):
         self.exists = exists
@@ -176,6 +177,9 @@ class _FlakyVenue:
 
     async def cancel(self, symbol, coid):
         return None
+
+    async def fetch_balances(self):
+        return {}
 
     async def query(self, symbol, coid):
         if not self.exists:

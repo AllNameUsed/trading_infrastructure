@@ -71,6 +71,29 @@ SIM_LATENCY_MEDIAN_MS = 40.0
 RISK_MAX_ORDER_NOTIONAL = 5_000.0
 RISK_MOCK_REJECTION_PROBABILITY = 0.20
 
+# Portfolio-wide risk (risk/supervisor.py): one book per execution mode, so a paper loss
+# can never halt real money. Capital is the SYSTEM's allocation in quote currency (USDT),
+# not the whole account. Every mode a strategy is routed to needs capital > 0.
+RISK_CAPITAL = {
+    ExecutionMode.SIM: SIM_INITIAL_BALANCES["USDT"],
+    ExecutionMode.TESTNET: 10_000.0,
+    ExecutionMode.LIVE: 0.0,            # <-- set to the live allocation before routing anything LIVE
+}
+RISK_DRAWDOWN_WINDOW_HOURS = 24.0       # trailing window of the peak-to-now rule
+RISK_MAX_DRAWDOWN_WINDOW = 0.05         # 5 % below the trailing-window peak -> HALT_COMPLETE
+RISK_MAX_DRAWDOWN_HWM = 0.10            # 10 % below the all-time high-water mark -> HALT_COMPLETE
+
+# =====================================================================
+# Kill switch (risk/kill_switch.py)
+# =====================================================================
+# Operator files, never committed: YOU edit kill_switch.ini (halt / reset), the system
+# writes kill_switch_status.txt. Override the folder with KILL_SWITCH_DIR in .env.
+KILL_SWITCH_DIR = Path(os.getenv("KILL_SWITCH_DIR", str(PROJECT_ROOT / "config")))
+KILL_SWITCH_CONTROL_FILE = KILL_SWITCH_DIR / "kill_switch.ini"
+KILL_SWITCH_STATUS_FILE = KILL_SWITCH_DIR / "kill_switch_status.txt"
+KILL_SWITCH_POLL_SECONDS = 2.0          # how often the control file is read
+KILL_SWITCH_FLATTEN_RETRY_SECONDS = 3.0 # HALT_COMPLETE: cancel/flatten round interval
+
 
 def validate() -> None:
     """Fail loudly at startup instead of silently at 2pm."""
@@ -79,3 +102,7 @@ def validate() -> None:
         raise ValueError("Strategies are routed LIVE but BINANCE_LIVE_API_KEY / BINANCE_LIVE_SECRET are missing in .env")
     if ExecutionMode.TESTNET in modes and not (BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_SECRET):
         raise ValueError("Strategies are routed TESTNET but BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_SECRET are missing in .env")
+    unfunded = sorted(m.name for m in modes if RISK_CAPITAL.get(m, 0.0) <= 0)
+    if unfunded:
+        raise ValueError(f"Strategies are routed to {unfunded} but RISK_CAPITAL has no positive capital for them: "
+                         f"the drawdown rules cannot work without it.")

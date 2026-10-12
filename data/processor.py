@@ -10,6 +10,8 @@ Rules:
 2. Single Source of Truth: strategies MUST NOT maintain their own price arrays.
 3. Monotonic windows: a bar whose start time is not strictly newer than the
    window's last bar is discarded (backfill/live overlap, duplicate deliveries).
+   A newer bar that is not contiguous is kept but logged as a window hole (the
+   feed heals live gaps before publishing, so this should never fire).
 4. Replay propagation: ParamsReady inherits BarClosed.replay so downstream
    decision makers can refuse to trade on history.
 """
@@ -84,9 +86,14 @@ class DataProcessor:
         window = self._windows.get(bar.symbol)
         if window is None:
             return
+        prev = window.bars[-1] if window.bars else None
         if not window.append(bar):
             logger.debug(f"Duplicate/out-of-order bar for {bar.symbol} at {bar.start_time} discarded.")
             return
+        # close_time = start + interval - 1 ms, so a contiguous next bar starts at close_time + 1 ms.
+        if prev is not None and int(bar.start_time.timestamp() * 1000) != int(prev.close_time.timestamp() * 1000) + 1:
+            logger.warning(f"[DATA] {bar.symbol}: window hole between {prev.start_time:%Y-%m-%d %H:%M} and "
+                           f"{bar.start_time:%Y-%m-%d %H:%M}; features span the gap.")
         if not window.is_warmed_up:
             return
 

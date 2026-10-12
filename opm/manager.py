@@ -11,10 +11,10 @@ The Open Position Manager (OPM).
 
 import logging
 import random
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from messages.events import EventPriority, IntentIssued, ParamsReady, PositionChanged, PositionClosed, PositionOpened
-from messages.model import Intent, IntentKind, MarketParams, OrderType, Position
+from messages.model import Intent, IntentKind, MarketParams, OrderType, Position, utc_now
 from opm.lock import LockManager
 
 logger = logging.getLogger("OpenPositionManager")
@@ -38,6 +38,8 @@ class OpenPositionManager:
         ROUTE B  otherwise -> _independent_risk_check (placeholder RNG; trailing stop /
                  take-profit / time-stop engines go here - see opm/engines.py, planned)
         exit -> build CLOSE intent for |quantity| -> lock.try_begin_exit -> publish
+    rehydrate(positions)   startup only: mirror the open positions; bars held = whole bar
+                           intervals since opened_at (downtime included)
     """
     def __init__(
         self,
@@ -60,6 +62,15 @@ class OpenPositionManager:
     # =================================================================
     # 1. Position mirror
     # =================================================================
+    def rehydrate(self, positions: List[Position], bar_seconds: float = 60.0) -> None:
+        now = utc_now()
+        for pos in positions:
+            key = (pos.strategy_id, pos.symbol)
+            self._active_positions[key] = pos
+            self._bars_held[key] = max(0, int((now - pos.opened_at).total_seconds() // bar_seconds))
+            logger.info(f"[OPM] Rehydrated {key}: managing {pos.quantity:.8g} @ {pos.average_entry_price:.8g}, "
+                        f"{self._bars_held[key]} bar(s) held.")
+
     def on_position_opened(self, event: PositionOpened) -> None:
         key = (event.position.strategy_id, event.position.symbol)
         self._active_positions[key] = event.position

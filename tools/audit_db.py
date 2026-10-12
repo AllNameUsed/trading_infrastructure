@@ -27,9 +27,14 @@ def audit_database(hours: float = 4.0) -> None:
     print("=" * 60)
     print(f" ROW COUNTS ({DB_PATH})")
     print("=" * 60)
-    for table in ("klines", "intents", "orders", "fills", "positions", "risk_ledger"):
+    tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    for table in ("klines", "intents", "orders", "fills", "positions", "risk_ledger", "trades", "trade_fills",
+                  "halts", "strategy_pnl", "portfolio_equity"):
+        if table not in tables:
+            print(f"  {table:<16} (absent: older schema)")
+            continue
         (n,) = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-        print(f"  {table:<12} {n}")
+        print(f"  {table:<16} {n}")
 
     counts = cur.execute("SELECT symbol, COUNT(*) FROM klines WHERE interval = ? GROUP BY symbol",
                          (BAR_INTERVAL,)).fetchall()

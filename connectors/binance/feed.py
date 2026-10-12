@@ -6,6 +6,11 @@ Maintains a persistent kline websocket, parses closed candles into Bars and
 publishes BarClosed. On every (re)connect it backfills the gap since the last
 bar it knows of via REST, publishing those bars with replay=True: they bring
 the rolling windows up to date but can never trigger a trade.
+
+Live hole-filling: if a live closed bar arrives more than one interval after
+the last bar published for its symbol (a message lost without a disconnect),
+the missing closed bars are fetched via REST and published as replay=True
+BEFORE the live bar, so the windows never contain a silent hole.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ class BinanceFeed:
         _ws             current connection (closed by stop())
     Lifecycle: start() loops connect -> _backfill_gaps() -> read messages, reconnecting with
     exponential backoff (1s .. 60s); stop() ends the loop. Intra-candle updates are ignored.
+    Live gap: _heal_live_gap() REST-fills [last + 1 interval, live - 1 interval] as replay first.
     Combined-stream URL: wss://stream.binance.com:9443/stream?streams=<sym>@kline_<tf>/...
     """
     def __init__(
@@ -115,7 +121,31 @@ class BinanceFeed:
         bar = bar_from_ws_kline(data["k"])
         if not bar.is_closed:
             return   # intra-candle updates ignored
+        await self._heal_live_gap(bar)
         await self._publish(bar, replay=False)
+
+    async def _heal_live_gap(self, bar) -> None:
+        """A live bar that skips intervals: publish the missing closed bars (REST, replay) first."""
+        last = self._last_start_ms.get(bar.symbol)
+        step = interval_ms(self.timeframe)
+        start_ms = int(bar.start_time.timestamp() * 1000)
+        if last is None or self.rest is None or start_ms <= last + step:
+            return
+        missing = (start_ms - last) // step - 1
+        logger.warning(f"[GAP] {bar.symbol}: live bar {bar.start_time:%H:%M} arrived with {missing} bar(s) missing "
+                       f"since the last one; healing via REST before publishing it.")
+        try:
+            bars = await self.rest.fetch_bars(bar.symbol, self.timeframe, start_ms=last + step,
+                                              end_ms=start_ms - step)
+        except Exception as e:
+            logger.error(f"[GAP] {bar.symbol}: could not heal the live gap ({e}); the window keeps a hole "
+                         f"until the next restart heals the store.")
+            return
+        bars = [b for b in bars if b.start_time < bar.start_time]   # never let history shadow the live bar
+        for b in bars:
+            await self._publish(b, replay=True)
+        (logger.info if len(bars) == missing else logger.error)(
+            f"[GAP] {bar.symbol}: healed {len(bars)}/{missing} missing bar(s) (replay).")
 
     async def _publish(self, bar, replay: bool) -> None:
         """Publishes a bar unless one with the same or a later start time was already published."""

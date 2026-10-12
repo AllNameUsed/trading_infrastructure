@@ -26,8 +26,9 @@ Catalogue (publisher -> consumers, default priority):
   CancelIssued         (any decision maker) -> OMS                                             HIGH
   Order* (OrderEvent)  OMS -> Portfolio (-50, fills), Lock (-40), recorders                    HIGH
   Position*            PortfolioManager -> Lock (-100), OPM                                    HIGH
-  RiskBreach           OMS (vanished orders) -> Journal                                        CRITICAL
-  SignalGenerated, ResizeRequest, KillSwitch, Heartbeat                                        PLANNED
+  RiskBreach           OMS (vanished orders), Rehydrator -> Journal, KillSwitch (HALT_ENTRIES) CRITICAL
+  KillSwitch           KillSwitchController (every level change) -> Journal                    CRITICAL
+  SignalGenerated, ResizeRequest, Heartbeat                                                    PLANNED
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ from typing import Optional
 from messages.model import (
     Bar,
     CancelIntent,
+    ExecutionMode,
     Fill,
+    HaltLevel,
     Intent,
     MarketParams,
     OrderSnapshot,
@@ -249,18 +252,29 @@ class PositionClosed(Event):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RiskBreach(Event):
     """
-    A genuine breach (drawdown, unresolved order state, ledger divergence).
+    A genuine breach (unresolved order state, ledger divergence).
     NOT used for routine pre-trade rejections - those are IntentRejected.
+    The kill switch answers every breach with HALT_ENTRIES on `mode` (all modes when None).
     """
     rule_name: str
     symbol: Optional[str]
     detail: str
+    mode: Optional[ExecutionMode] = None
     priority: EventPriority = EventPriority.CRITICAL
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KillSwitch(Event):
-    """Universal circuit breaker."""
+    """
+    The halt level of one execution mode changed (published only by the
+    KillSwitchController, risk/kill_switch.py): an escalation, or an operator reset
+    back to NONE. Informational - the controller itself enforces the halt.
+      halt_id   the episode id the operator must quote in config/kill_switch.ini to reset
+    """
+    mode: ExecutionMode
+    level: HaltLevel
+    previous_level: HaltLevel
+    halt_id: str
     source: str
     reason: str
     priority: EventPriority = EventPriority.CRITICAL

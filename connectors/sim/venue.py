@@ -46,6 +46,12 @@ What is simulated
   Fees
     * Taker/maker rates; by default charged in the RECEIVED asset like Binance
       without BNB (base on buys, quote on sells).
+  Restarts
+    * The simulator is in-memory and forgets everything when the process stops
+      (survives_restart = False). Rehydration therefore treats the store as the
+      truth: it rebuilds the balances from the fills ledger (restore_from_fills) and
+      marks orders that were working at the stop as canceled. Trade and order ids
+      carry a per-process tag, so they never repeat across restarts.
   Degraded mode
     * If no live quote/trade stream is attached, closed bars synthesize a book
       (close +/- a half-spread) and resting/stop orders are evaluated against
@@ -64,6 +70,7 @@ import logging
 import math
 import random
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -198,10 +205,12 @@ class SimulatedVenue:
         _resting    Dict[symbol, Dict[coid, _SimOrder]]   working orders (incl. untriggered stops)
         _free / _locked   Dict[asset, float]   account balances
     Inspection: balances() -> {asset: {"free", "locked"}}
+    Restart: restore_from_fills(fills) before start() (rehydration); fetch_balances() -> totals
     """
     venue_id = "BINANCE"          # simulates Binance Spot: same instruments and rules
     mode = ExecutionMode.SIM
     needs_polling = False         # pushes execution reports itself
+    survives_restart = False      # in-memory: orders and balances die with the process
 
     def __init__(self, instruments: InstrumentRegistry, config: Optional[SimConfig] = None):
         self.instruments = instruments
@@ -215,6 +224,7 @@ class SimulatedVenue:
         self._recent_orders: Deque[float] = deque()
         self._trade_ids = itertools.count(1)
         self._order_ids = itertools.count(1)
+        self._run_tag = uuid.uuid4().hex[:6]               # ids stay unique across restarts
         self._handler: Optional[UpdateHandler] = None
         self._wire: asyncio.Queue[Tuple[float, VenueOrderUpdate]] = asyncio.Queue()
         self._dispatcher: Optional[asyncio.Task] = None
@@ -235,6 +245,31 @@ class SimulatedVenue:
 
     def set_update_handler(self, handler: UpdateHandler) -> None:
         self._handler = handler
+
+    def restore_from_fills(self, fills: List[Fill]) -> None:
+        """
+        Rehydration: the account = initial balances + every fill the system ever recorded for
+        this venue (spot cash flows, fees in their own asset). All free: nothing rests after a restart.
+        """
+        if self._resting_count() or self._orders:
+            raise RuntimeError("restore_from_fills() on a simulator that already has orders")
+        free: Dict[str, float] = dict(self.cfg.initial_balances)
+        for f in fills:
+            spec = self.instruments.require(f.symbol)
+            sign = f.side.sign
+            free[spec.base_asset] = free.get(spec.base_asset, 0.0) + sign * f.quantity
+            free[spec.quote_asset] = free.get(spec.quote_asset, 0.0) - sign * f.quantity * f.price
+            free[f.fee_asset] = free.get(f.fee_asset, 0.0) - f.fee
+        self._free = {a: q for a, q in free.items() if abs(q) > _EPS}
+        self._locked = {}
+        logger.info(f"SimulatedVenue restored from {len(fills)} recorded fill(s): {self.balances()}")
+
+    def _resting_count(self) -> int:
+        return sum(len(v) for v in self._resting.values())
+
+    async def fetch_balances(self) -> Dict[str, float]:
+        """Account totals (free + locked) per asset."""
+        return {a: b["free"] + b["locked"] for a, b in self.balances().items()}
 
     def balances(self) -> Dict[str, Dict[str, float]]:
         assets = set(self._free) | set(self._locked)
@@ -348,7 +383,7 @@ class SimulatedVenue:
         if err:
             raise _Reject(f"[-1013] {err}")
 
-        order = _SimOrder(request=req, venue_order_id=f"SIM{next(self._order_ids)}")
+        order = _SimOrder(request=req, venue_order_id=f"SIM{self._run_tag}-{next(self._order_ids)}")
         spec = self.instruments.require(sym)
 
         if is_stop:
@@ -461,7 +496,7 @@ class SimulatedVenue:
         order.fills.append(Fill(
             client_order_id=req.client_order_id, strategy_id="", intent_id="", symbol=req.symbol,
             side=req.side, quantity=qty, price=price, fee=fee, fee_asset=fee_asset, is_maker=maker,
-            exchange_trade_id=f"SIM-T{next(self._trade_ids)}", timestamp=utc_now(),
+            exchange_trade_id=f"SIM-{self._run_tag}-T{next(self._trade_ids)}", timestamp=utc_now(),
         ))
         if order.remaining <= _EPS:
             self._close(order, OrderStatus.FILLED, "")

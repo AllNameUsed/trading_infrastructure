@@ -19,6 +19,13 @@ Responsibilities (and invariants):
      reconciles it against the venue by client order id until resolved.
   5. Fills are de-duplicated by exchange trade id, so the same execution
      reported by a submit response, a poll and a push can only count once.
+  6. The kill switch gate: while the strategy's execution mode is halted
+     (any HaltLevel above NONE), ENTRY intents end in IntentRejected(HALTED) -
+     a normal terminal outcome, so the lock settles and the journal keeps the
+     signal. Exits (incl. the kill switch's own FLATTEN) are never gated.
+  7. Restart rehydration: working orders are rebuilt from the store. On a venue
+     that survives our restart they are reconciled by query; on one that does
+     not (the simulator) they are closed as CANCELED - they died with the venue.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from connectors.base import ExecutionVenue, VenueUnknownOutcome
 from execution.order_ids import generate_client_order_id
@@ -53,7 +60,9 @@ from messages.model import (
     STOP_TYPES,
     ExecutionMode,
     Fill,
+    HaltLevel,
     Intent,
+    IntentKind,
     OrderRequest,
     OrderSnapshot,
     OrderStatus,
@@ -117,6 +126,7 @@ class OrderManagementSystem:
     Depends on:  VenueRouter (ports), PreTradeRiskManager, InstrumentRegistry, SqliteStore,
                  market_view(symbol) -> dict          (DataProcessor read model, for risk)
                  position_view(sid, sym) -> Position  (PortfolioManager read model, for exits)
+                 halt_view(mode) -> HaltLevel         (KillSwitchController, the entry gate; optional)
 
     State:
         _orders      Dict[client_order_id, Order]   WORKING orders only (removed when terminal)
@@ -126,9 +136,11 @@ class OrderManagementSystem:
     API:
         start() / stop(timeout)                     start poller / cancel it and await in-flight calls
         working_orders() -> [OrderSnapshot]
+        cancel_all_working(mode) -> int             kill switch: cancel every non-FLATTEN working order
+        rehydrate(entries) -> [problem]             startup only, before the bus and the poller run
 
     Intent pipeline (_process_intent, on the bus loop, no network I/O):
-        1 registry  2 routing  3 instrument  4 exits: reduce-only clamp + cancel resting entries
+        1 registry  2 routing  2b halt gate (entries)  3 instrument  4 exits: reduce-only clamp + cancel resting entries
         5 round to lot/tick  6 risk.validate  7 write-ahead (durable upsert)  8 spawn _submit task
         any failure -> _reject() -> IntentRejected(stage, rule, reason)
     Venue results (_apply_update, the ONLY mutator): de-dup fills by trade id, decide the
@@ -150,6 +162,7 @@ class OrderManagementSystem:
         position_view: Callable[[str, str], Optional[Position]],
         poll_interval: float = 3.0,
         unknown_resolution_seconds: float = 30.0,
+        halt_view: Optional[Callable[[ExecutionMode], HaltLevel]] = None,
     ):
         self.bus = bus
         self.store = store
@@ -161,11 +174,14 @@ class OrderManagementSystem:
         self.position_view = position_view
         self.poll_interval = poll_interval
         self.unknown_resolution_seconds = unknown_resolution_seconds
+        self.halt_view = halt_view
 
         self._orders: Dict[str, Order] = {}        # WORKING orders only (non-terminal)
         self._tasks: Set[asyncio.Task] = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._breached: Set[str] = set()
+        self._reconcile: Set[str] = set()          # rehydrated orders to query once, whatever the venue
+        self._cancelling: Set[str] = set()         # cancels in flight (never stacked)
 
         self.bus.subscribe(IntentIssued, self.on_intent_issued)
         self.bus.subscribe(CancelIssued, self.on_cancel_issued)
@@ -189,6 +205,65 @@ class OrderManagementSystem:
 
     def working_orders(self) -> List[OrderSnapshot]:
         return [o.snapshot() for o in self._orders.values()]
+
+    # =================================================================
+    # Restart rehydration (startup only: before the bus and the poller run)
+    # =================================================================
+    async def rehydrate(self, entries: List[Tuple[OrderSnapshot, List[Fill], Optional[str]]]) -> List[str]:
+        """
+        Rebuilds the working-order aggregates from the store's last snapshots and fills.
+        Venue survives restarts -> keep working and query each order once (PENDING_SUBMIT
+        becomes UNKNOWN: we cannot know whether it was sent). Venue forgets on restart (SIM)
+        -> CANCELED and persisted. Returns integrity problems.
+        """
+        if self._orders:
+            raise RuntimeError("rehydrate() on an OMS that already has working orders")
+        problems: List[str] = [p for _, _, p in entries if p]
+        for snap, fills, _ in entries:
+            order = Order(
+                client_order_id=snap.client_order_id, strategy_id=snap.strategy_id, mode=snap.mode,
+                intent=snap.intent, request=snap.request, status=snap.status,
+                filled_quantity=snap.filled_quantity, average_price=snap.average_price,
+                cumulative_fee=snap.cumulative_fee, venue_order_id=snap.venue_order_id, version=snap.version,
+                created_at=snap.created_at, updated_at=snap.updated_at,
+                seen_trade_ids={f.exchange_trade_id for f in fills})
+            fill_qty = sum(f.quantity for f in fills)
+            if abs(fill_qty - order.filled_quantity) > _QTY_EPS:
+                problems.append(f"order {order.client_order_id}: filled {order.filled_quantity} but fills sum "
+                                f"to {fill_qty}")
+            venue = self.router.venue_for(order.mode)
+            if venue is None:
+                problems.append(f"order {order.client_order_id}: no venue for mode {order.mode.name}")
+                continue
+            if not venue.survives_restart:
+                prev = order.status
+                order.status, order.updated_at, order.version = OrderStatus.CANCELED, utc_now(), order.version + 1
+                await self.store.upsert_order(order.snapshot())
+                logger.warning(f"[OMS] Rehydrate {order.client_order_id}: {prev.name} -> CANCELED "
+                               f"({venue.mode.name} venue does not survive restarts; the order died with it)")
+                continue
+            if order.status is OrderStatus.PENDING_SUBMIT:
+                order.status, order.updated_at, order.version = OrderStatus.UNKNOWN, utc_now(), order.version + 1
+                await self.store.upsert_order(order.snapshot())
+            self._orders[order.client_order_id] = order
+            self._reconcile.add(order.client_order_id)
+            logger.info(f"[OMS] Rehydrated working order {order.client_order_id} ({order.status.name}, "
+                        f"filled {order.filled_quantity}/{order.request.quantity}); reconciling with the venue.")
+        return problems
+
+    # =================================================================
+    # Kill switch support
+    # =================================================================
+    def cancel_all_working(self, mode: ExecutionMode) -> int:
+        """Requests a cancel for every working order of `mode` except FLATTEN orders. Returns the count."""
+        targets = [o for o in self._orders.values()
+                   if o.mode is mode and o.intent.kind is not IntentKind.FLATTEN
+                   and o.status is not OrderStatus.PENDING_SUBMIT        # still in flight: next round
+                   and o.client_order_id not in self._cancelling]
+        for order in targets:
+            logger.warning(f"[OMS] Kill switch: cancelling working order {order.client_order_id}")
+            self._request_cancel(order)
+        return len(targets)
 
     # =================================================================
     # Intent intake (runs on the bus loop: no network I/O here)
@@ -216,6 +291,13 @@ class OrderManagementSystem:
         venue = self.router.venue_for(mode)
         if venue is None:
             return await self._reject(intent, RejectStage.ROUTING, "Router", f"No venue configured for mode {mode.name}")
+
+        # 2b. Kill switch: a halted mode takes no new entries (exits always pass).
+        if intent.kind.is_entry and self.halt_view is not None:
+            level = self.halt_view(mode)
+            if level is not HaltLevel.NONE:
+                return await self._reject(intent, RejectStage.HALTED, "KillSwitch",
+                                          f"{mode.name} is halted ({level.name}): no new entries")
 
         # 3. Instrument
         spec = self.instruments.get(symbol)
@@ -313,25 +395,29 @@ class OrderManagementSystem:
 
     def _request_cancel(self, order: Order) -> None:
         venue = self.router.venue_for(order.mode)
-        if venue is None:
+        if venue is None or order.client_order_id in self._cancelling:
             return
+        self._cancelling.add(order.client_order_id)
         self._spawn(self._cancel(order, venue), f"cancel-{order.client_order_id}")
 
     async def _cancel(self, order: Order, venue: ExecutionVenue) -> None:
         """Background task: cancel; if the venue doesn't recognise it, query and apply the truth."""
         try:
-            update = await venue.cancel(order.request.symbol, order.client_order_id)
-        except Exception as e:
-            logger.error(f"[OMS CANCEL] {order.client_order_id} cancel failed: {e}; reconciling.")
-            update = None
-        if update is None:
             try:
-                update = await venue.query(order.request.symbol, order.client_order_id)
+                update = await venue.cancel(order.request.symbol, order.client_order_id)
             except Exception as e:
-                logger.error(f"[OMS CANCEL] reconcile query failed for {order.client_order_id}: {e}")
-                return
-        if update is not None:
-            await self._apply_update(order, update)
+                logger.error(f"[OMS CANCEL] {order.client_order_id} cancel failed: {e}; reconciling.")
+                update = None
+            if update is None:
+                try:
+                    update = await venue.query(order.request.symbol, order.client_order_id)
+                except Exception as e:
+                    logger.error(f"[OMS CANCEL] reconcile query failed for {order.client_order_id}: {e}")
+                    return
+            if update is not None:
+                await self._apply_update(order, update)
+        finally:
+            self._cancelling.discard(order.client_order_id)
 
     # =================================================================
     # Venue interaction (background tasks)
@@ -375,7 +461,9 @@ class OrderManagementSystem:
                     venue = self.router.venue_for(order.mode)
                     if venue is None or order.status is OrderStatus.PENDING_SUBMIT:
                         continue   # submit still in flight - its own task will report
-                    if order.status is OrderStatus.UNKNOWN or venue.needs_polling:
+                    once = order.client_order_id in self._reconcile
+                    if order.status is OrderStatus.UNKNOWN or venue.needs_polling or once:
+                        self._reconcile.discard(order.client_order_id)
                         await self._poll_one(order, venue)
             except asyncio.CancelledError:
                 return
@@ -406,7 +494,7 @@ class OrderManagementSystem:
         elif order.status is not OrderStatus.UNKNOWN and order.client_order_id not in self._breached:
             self._breached.add(order.client_order_id)
             await self.bus.publish(RiskBreach(
-                rule_name="OrderVanished", symbol=order.request.symbol,
+                rule_name="OrderVanished", symbol=order.request.symbol, mode=order.mode,
                 detail=f"Working order {order.client_order_id} ({order.status.name}) not found at venue"))
 
     # =================================================================

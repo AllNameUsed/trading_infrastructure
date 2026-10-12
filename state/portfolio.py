@@ -37,6 +37,15 @@ Trade journal (`trades` + `trade_fills`):
   step. Every fill is linked to its trade; a fill that flips a position through
   zero is split into a closing leg and an opening leg, each with its share of the
   quantity and fee.
+
+Restart rehydration (`rehydrate()`, called once at startup before the bus runs):
+  The ledgers are rebuilt from the store, never guessed:
+    * a ledger whose newest trade is CLOSED holds that trade's residual (if any) at
+      its residual price;
+    * a ledger with an OPEN trade is REPLAYED from the trade's carried-in residual
+      through its fill legs with the same arithmetic as live (`_ledger_step`), then
+      checked against the persisted `positions` and `trades` rows.
+  Any disagreement is returned as a problem; the rehydrator answers it with a halt.
 """
 
 from __future__ import annotations
@@ -57,11 +66,54 @@ from messages.events import (
     PositionOpened,
 )
 from messages.instruments import InstrumentRegistry
-from messages.model import ExecutionMode, Fill, OrderSnapshot, Position, TradeRecord, new_id, utc_now
+from state.stores import from_ms
+from messages.model import (
+    ExecutionMode,
+    Fill,
+    OrderSide,
+    OrderSnapshot,
+    Position,
+    StrategyPnL,
+    TradeRecord,
+    new_id,
+    utc_now,
+)
 
 logger = logging.getLogger("PortfolioManager")
 
 Key = Tuple[str, str]
+PairKey = Tuple[ExecutionMode, str, str]     # (mode, strategy_id, symbol): one PnL line
+
+
+@dataclass
+class _ClosedStats:
+    """Cumulative closed-trade totals of one (mode, strategy, symbol) pair."""
+    realized: float = 0.0
+    fees: float = 0.0
+    trades: int = 0
+    winners: int = 0
+
+
+def _ledger_step(old_qty: float, old_avg: float, realized: float, qty_delta: float, fee_quote: float,
+                 price: float) -> Tuple[float, float, float]:
+    """
+    The ledger arithmetic for one leg (pure; shared by live fills and rehydration replay):
+    (quantity, average entry, realized PnL) after applying a signed base delta at `price`
+    with a fee already valued in quote. Adding -> weighted average entry; reducing ->
+    realized += closed * (price - avg) * direction.
+    """
+    new_qty = round(old_qty + qty_delta, 12)   # strip float residue; far below any lot step
+    realized -= fee_quote
+    if old_qty == 0 or (old_qty > 0) == (qty_delta > 0):
+        # Opening or adding: weighted average entry (fees tracked separately).
+        gross = abs(old_qty) + abs(qty_delta)
+        new_avg = (abs(old_qty) * old_avg + abs(qty_delta) * price) / gross if gross else 0.0
+    else:
+        # Reducing (through zero only into a sub-lot residual - real flips were split).
+        closed = min(abs(qty_delta), abs(old_qty))
+        realized += closed * (price - old_avg) * (1 if old_qty > 0 else -1)
+        new_avg = price if abs(qty_delta) > abs(old_qty) else old_avg
+    return new_qty, (new_avg if new_qty else 0.0), realized
 
 
 @dataclass
@@ -182,11 +234,16 @@ class PortfolioManager:
     State:
         _ledgers          Dict[(sid, sym), Position]      every ledger, INCLUDING sub-lot residuals
         _trades           Dict[(sid, sym), _OpenTrade]    the trade open on each ledger
+        _closed           Dict[(mode, sid, sym), _ClosedStats]   cumulative closed-trade totals
         global_metrics    PerformanceMetrics
         strategy_metrics  Dict[strategy_id, PerformanceMetrics]
     API (read models, synchronous):
         get_position(sid, sym) -> Position|None    only when >= one lot step (used by the OMS and the lock)
         get_open_positions() / net_quantity(sym) / get_residual(sid, sym) / get_strategy_metrics(sid)
+        ledgers() -> [Position]                    every ledger incl. sub-lot residuals
+        pnl_at_cost() -> [StrategyPnL]             per (mode, strategy, symbol), cumulative, unmarked:
+                                                   updated atomically with each fill (risk supervisor)
+        rehydrate() -> [problem]                   startup only, before the bus runs
     apply_fill math: signed delta = side.sign * qty (- base-asset fee); adding -> weighted
     average entry; reducing -> realized += closed_qty * (px - avg) * direction; a fill that
     flips through zero is split into two legs (two trades); |qty| < lot step -> flat, the
@@ -198,6 +255,7 @@ class PortfolioManager:
         self.store = store
         self._ledgers: Dict[Key, Position] = {}
         self._trades: Dict[Key, _OpenTrade] = {}
+        self._closed: Dict[PairKey, _ClosedStats] = {}
         self.global_metrics = PerformanceMetrics()
         self.strategy_metrics: Dict[str, PerformanceMetrics] = {}
 
@@ -283,20 +341,10 @@ class PortfolioManager:
             prev = dataclasses.replace(prev, realized_pnl=0.0, fees_paid=0.0, opened_at=fill.timestamp,
                                        trade_id=trade.trade_id)
 
-        old_qty, old_avg = prev.quantity, prev.average_entry_price
-        new_qty = round(old_qty + qty_delta, 12)   # strip float residue; far below any lot step
-        realized = prev.realized_pnl - fee_quote
-        if old_qty == 0 or (old_qty > 0) == (qty_delta > 0):
-            # Opening or adding: weighted average entry (fees tracked separately).
-            gross = abs(old_qty) + abs(qty_delta)
-            new_avg = (abs(old_qty) * old_avg + abs(qty_delta) * fill.price) / gross if gross else 0.0
-        else:
-            # Reducing (through zero only into a sub-lot residual - real flips were split).
-            closed = min(abs(qty_delta), abs(old_qty))
-            realized += closed * (fill.price - old_avg) * (1 if old_qty > 0 else -1)
-            new_avg = fill.price if abs(qty_delta) > abs(old_qty) else old_avg
-
-        pos = dataclasses.replace(prev, quantity=new_qty, average_entry_price=new_avg if new_qty else 0.0,
+        old_qty = prev.quantity
+        new_qty, new_avg, realized = _ledger_step(old_qty, prev.average_entry_price, prev.realized_pnl,
+                                                  qty_delta, fee_quote, fill.price)
+        pos = dataclasses.replace(prev, quantity=new_qty, average_entry_price=new_avg,
                                   realized_pnl=realized, fees_paid=prev.fees_paid + fee_quote, updated_at=now)
         trade.add_leg(order, fill, new_qty)
         effects: List[Awaitable[None]] = [self._link(trade.trade_id, fill)]
@@ -353,6 +401,11 @@ class PortfolioManager:
                                      residual_quantity=residual)
         record = trade.record(status="CLOSED", realized=realized, fees=pos.fees_paid, residual_qty=residual,
                               residual_price=fill.price, exit_time=fill.timestamp)
+        stats = self._closed.setdefault((pos.mode, pos.strategy_id, pos.symbol), _ClosedStats())
+        stats.realized += realized
+        stats.fees += pos.fees_paid
+        stats.trades += 1
+        stats.winners += realized > 0
         logger.info(f"[PORTFOLIO] CLOSED {key} realized={realized:.4f} (net of {pos.fees_paid:.4f} fees)"
                     + (f" | residual {residual:.8g} carried @ {fill.price:.8g}" if residual else ""))
         self._record_round_trip(closed)
@@ -409,3 +462,128 @@ class PortfolioManager:
 
     def get_strategy_metrics(self, strategy_id: str) -> PerformanceMetrics:
         return self.strategy_metrics.get(strategy_id, PerformanceMetrics())
+
+    def ledgers(self) -> List[Position]:
+        """Every ledger, sub-lot residuals included (what the account holds per strategy)."""
+        return list(self._ledgers.values())
+
+    def pnl_at_cost(self) -> List[StrategyPnL]:
+        """
+        One line per (mode, strategy, symbol) ever traded: closed-trade totals + the ledger
+        (open trade's realized part and fees, the holding incl. residual) - NOT marked to market
+        (mark_price None, unrealized 0). Consistent at any instant: it changes only inside
+        apply_fill's synchronous mutation, so a reader never sees a closed trade counted twice
+        or not at all.
+        """
+        now = utc_now()
+        ledgers = {(p.mode, p.strategy_id, p.symbol): p for p in self._ledgers.values()}
+        out: List[StrategyPnL] = []
+        for key in self._closed.keys() | ledgers.keys():
+            stats = self._closed.get(key) or _ClosedStats()
+            pos = ledgers.get(key)
+            realized = stats.realized + (pos.realized_pnl if pos else 0.0)
+            out.append(StrategyPnL(
+                timestamp=now, mode=key[0], strategy_id=key[1], symbol=key[2],
+                position_qty=pos.quantity if pos else 0.0,
+                avg_entry_price=pos.average_entry_price if pos else 0.0, mark_price=None,
+                realized_pnl=realized, unrealized_pnl=0.0, total_pnl=realized,
+                fees_paid=stats.fees + (pos.fees_paid if pos else 0.0),
+                closed_trades=stats.trades, winning_trades=stats.winners))
+        return out
+
+    # =================================================================
+    # Restart rehydration
+    # =================================================================
+    async def rehydrate(self) -> List[str]:
+        """
+        Rebuilds every ledger, open trade and the round-trip metrics from the store.
+        Startup only (before the bus runs). Returns integrity problems (empty = consistent).
+        """
+        if self.store is None or self._ledgers or self._trades:
+            raise RuntimeError("rehydrate() needs a store and an empty portfolio")
+        problems: List[str] = []
+        open_rows = {(r["strategy_id"], r["symbol"]): r for r in await self.store.get_open_position_rows()}
+
+        for t in await self.store.get_latest_trades():
+            key: Key = (t["strategy_id"], t["symbol"])
+            mode = ExecutionMode(t["mode"])
+            if t["status"] == "CLOSED":
+                if key in open_rows:
+                    problems.append(f"{key}: positions row is OPEN but its newest trade {t['trade_id']} is CLOSED")
+                if t["residual_qty"]:
+                    exit_time = from_ms(t["exit_time"])
+                    self._ledgers[key] = Position(
+                        strategy_id=key[0], symbol=key[1], venue=t["venue"], mode=mode,
+                        quantity=t["residual_qty"], average_entry_price=t["residual_price"],
+                        opened_at=exit_time, updated_at=exit_time)
+                continue
+
+            # An open trade: replay its legs from the carried-in residual.
+            qty, avg = t["carried_in_qty"], t["carried_in_price"] if t["carried_in_qty"] else 0.0
+            realized = fees = 0.0
+            for leg in await self.store.get_trade_legs(t["trade_id"]):
+                fill = self._fill_from_row(leg, quantity=leg["leg_quantity"], fee=leg["leg_fee"])
+                qty_delta, fee_quote, _ = self._fee_effect(fill)
+                qty, avg, realized = _ledger_step(qty, avg, realized, qty_delta, fee_quote, fill.price)
+                fees += fee_quote
+            row = open_rows.get(key)
+            if abs(realized - t["realized_pnl"]) > 1e-9 * max(1.0, abs(realized)):
+                problems.append(f"{key}: replayed realized {realized:.10f} != trade row {t['realized_pnl']:.10f}")
+            if row is not None and abs(qty - row["quantity"]) > 1e-12:
+                problems.append(f"{key}: replayed quantity {qty:.12g} != positions row {row['quantity']:.12g}")
+            if row is None and not self._is_dust(key[1], qty):
+                problems.append(f"{key}: open trade {t['trade_id']} holds {qty:.12g} but has no OPEN positions row")
+            opened_at = from_ms(row["opened_at"]) if row is not None else from_ms(t["entry_time"])
+            self._ledgers[key] = Position(
+                strategy_id=key[0], symbol=key[1], venue=t["venue"], mode=mode, quantity=qty,
+                average_entry_price=avg, realized_pnl=realized, fees_paid=fees,
+                opened_at=opened_at, updated_at=utc_now(), trade_id=t["trade_id"])
+            self._trades[key] = self._open_trade_from_row(t)
+
+        for key in open_rows.keys() - self._ledgers.keys():
+            problems.append(f"{key}: OPEN positions row without any trade")
+        for r in await self.store.get_closed_trade_stats():
+            self._closed[(ExecutionMode(r["mode"]), r["strategy_id"], r["symbol"])] = _ClosedStats(
+                realized=r["realized_pnl"], fees=r["fees_paid"], trades=r["closed_trades"],
+                winners=r["winning_trades"])
+        for r in await self.store.get_closed_trades():
+            self.global_metrics.update(r["realized_pnl"])
+            self.strategy_metrics.setdefault(r["strategy_id"], PerformanceMetrics()).update(r["realized_pnl"])
+
+        for pos in self._ledgers.values():
+            what = "OPEN" if not self._is_dust(pos.symbol, pos.quantity) else "residual"
+            logger.info(f"[PORTFOLIO] Rehydrated {what} ({pos.strategy_id}, {pos.symbol}) qty={pos.quantity:.8g} "
+                        f"@ {pos.average_entry_price:.8g} [{pos.mode.name}]")
+        logger.info(f"[PORTFOLIO] Rehydration: {len(self._ledgers)} ledger(s), {len(self._trades)} open trade(s), "
+                    f"{self.global_metrics.total_closed} closed trade(s) in the metrics.")
+        for problem in problems:
+            logger.error(f"[PORTFOLIO] Rehydration integrity problem: {problem}")
+        return problems
+
+    @staticmethod
+    def _fill_from_row(r: dict, quantity: float, fee: float) -> Fill:
+        return Fill(client_order_id=r["client_order_id"], strategy_id=r["strategy_id"], intent_id=r["intent_id"],
+                    symbol=r["symbol"], side=OrderSide[r["side"]], quantity=quantity, price=r["price"], fee=fee,
+                    fee_asset=r["fee_asset"], is_maker=bool(r["is_maker"]),
+                    exchange_trade_id=r["exchange_trade_id"], timestamp=from_ms(r["timestamp"]))
+
+    @staticmethod
+    def _open_trade_from_row(t: dict) -> _OpenTrade:
+        """The journal row back into the mutable working record (price extremes from mae/mfe)."""
+        direction = 1 if t["direction"] == "LONG" else -1
+        avg = t["avg_entry_price"]
+        if direction > 0:
+            high, low = avg + t["mfe"], avg + t["mae"]
+        else:
+            high, low = avg - t["mae"], avg - t["mfe"]
+        return _OpenTrade(
+            trade_id=t["trade_id"], strategy_id=t["strategy_id"], symbol=t["symbol"], venue=t["venue"],
+            mode=ExecutionMode(t["mode"]), direction=direction, entry_time=from_ms(t["entry_time"]),
+            entry_intent_id=t["entry_intent_id"], entry_ref_price=t["entry_ref_price"],
+            carried_in_qty=t["carried_in_qty"], carried_in_price=t["carried_in_price"],
+            entry_qty=t["entry_qty"], entry_notional=t["entry_qty"] * avg,
+            exit_qty=t["exit_qty"], exit_notional=t["exit_qty"] * (t["avg_exit_price"] or 0.0),
+            max_quantity=t["max_quantity"], num_fills=t["num_fills"],
+            high=high if t["num_fills"] else -math.inf, low=low if t["num_fills"] else math.inf,
+            exit_intent_id=t["exit_intent_id"], exit_ref_price=t["exit_ref_price"], exit_reason=t["exit_reason"],
+        )

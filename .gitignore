@@ -12,6 +12,11 @@
 *.log
 sys.log
 
+# Kill switch operator files (runtime state, never versioned)
+config/kill_switch.ini
+config/kill_switch_status.txt
+config/kill_switch_status.tmp
+
 # Python Environments and Cache
 venv/
 __pycache__/

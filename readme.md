@@ -1,6 +1,6 @@
 # Trading System Skeleton — Architecture & Reconstruction Manual
 
-Oct 5, 2026 · @Jerry — **v2, revised Oct 10, 2026** to describe the implemented MVP · **schema v3, Oct 11, 2026**: trade journal and sub-lot residual ("dust") carry (§8.1, §8.2)
+Oct 5, 2026 · @Jerry — **v2, revised Oct 10, 2026** to describe the implemented MVP · **schema v3, Oct 11, 2026**: trade journal and sub-lot residual ("dust") carry (§8.1, §8.2) · **schema v4, Oct 12, 2026**: restart rehydration, live gap healing, kill switch, portfolio risk supervisor and per-strategy PnL (§6.1, §6.8–§6.10, §8.3)
 
 This document plus the class docstrings in the code are the complete description of the system. Read it top to bottom and you can rebuild every package: what each box is, which types flow between the boxes, the order things happen in, which component owns which piece of state, and why each trade-off was made. The v1 design (the architecture diagram in `Design Document.pdf` and the original skeleton) is still the soul of the project; where the implementation departed from it, the departure and its reason are written down here (§3, §15).
 
@@ -19,7 +19,9 @@ trading_infrastructure/
 ├── .env                           # secrets only (never committed)
 │
 ├── config/
-│   └── settings.py                # every tunable + strategy registry + validate()
+│   ├── settings.py                # every tunable + strategy registry + validate()
+│   ├── kill_switch.ini            # OPERATOR-written halt / reset (created on first run; gitignored)
+│   └── kill_switch_status.txt     # SYSTEM-written halt status (gitignored)
 │
 ├── messages/                      # THE ARROWS — imported by everyone, imports nothing
 │   ├── model.py                   #   nouns: Bar, MarketParams, Intent, OrderRequest, Fill,
@@ -44,7 +46,9 @@ trading_infrastructure/
 │   └── manager.py                 #   OpenPositionManager: exit decisions
 │
 ├── risk/                          # GREEN: Risk Manager
-│   └── pretrade.py                #   RiskRule chain + PreTradeRiskManager
+│   ├── pretrade.py                #   RiskRule chain + PreTradeRiskManager
+│   ├── supervisor.py              #   RiskSupervisor: per-mode books, drawdown rules, PnL tracking
+│   └── kill_switch.py             #   KillSwitchController: halt levels, flatten, operator files
 │
 ├── execution/                     # GREEN: OMS
 │   ├── oms.py                     #   OrderManagementSystem + Order aggregate
@@ -63,16 +67,18 @@ trading_infrastructure/
 │       └── venue.py               #     SimulatedVenue: matching engine on live mainnet quotes
 │
 ├── state/                         # BLUE: Persistent State
-│   ├── schema.sql                 #   tables (schema v3, epoch-ms timestamps)
-│   ├── stores.py                  #   SqliteStore: single-writer repository
-│   └── portfolio.py               #   PortfolioManager: per-strategy ledgers + trade journal (single writer)
+│   ├── schema.sql                 #   tables (schema v4, epoch-ms timestamps)
+│   ├── stores.py                  #   SqliteStore: single-writer repository + in-place migrations
+│   ├── portfolio.py               #   PortfolioManager: per-strategy ledgers + trade journal (single writer)
+│   └── rehydration.py             #   Rehydrator: restart = resume exactly where the store/venue left off
 │
 ├── ops/                           # BLUE: support services
 │   └── journal.py                 #   DatabaseJournal: audit trail
 │
 ├── tools/
 │   ├── audit_db.py                # offline DB inspection / kline continuity audit
-│   └── reconcile_trades.py        # rebuilds every trade from the fills and checks the journal
+│   ├── reconcile_trades.py        # rebuilds every trade from the fills and checks the journal
+│   └── strategy_report.py         # scorecard per (mode, strategy, symbol), books, active halts
 └── tests/                         # unittest suite (no network): python -m unittest discover -s tests -t .
 ```
 
@@ -83,10 +89,10 @@ trading_infrastructure/
 | Data Processing | `data/` | Facade | ✅ (placeholder features) |
 | Strategy | `strategies/` | Strategy + Template Method | ✅ (mock strategy) |
 | Open Position Manager | `opm/` | State (lock) + Strategy (exits) | ✅ lock / ⚠ exit engines are placeholders |
-| Risk Manager | `risk/` | Chain of Responsibility | ✅ pre-trade / ⏳ allocator, supervisor |
+| Risk Manager | `risk/` | Chain of Responsibility (pre-trade) + Observer (supervisor) | ✅ pre-trade / ✅ supervisor + kill switch / ⏳ allocator |
 | OMS | `execution/` | State (order lifecycle) + Command | ✅ |
 | Brokerage Connectors (out) | `connectors/binance/venue`, `connectors/sim` | Adapter behind a Port | ✅ |
-| Persistent State / SQLite | `state/` | Repository | ✅ |
+| Persistent State / SQLite | `state/` | Repository | ✅ (+ restart rehydration) |
 | Telegram Communicator | `ops/` | plain services | ⏳ (journal only) |
 | The arrows | `messages/` | immutable dataclasses | ✅ |
 | The hands | `main.py` | Composition root / DI | ✅ |
@@ -111,6 +117,8 @@ trading_infrastructure/
 9. **Unknown is not rejected.** A timed-out order stays UNKNOWN and keeps the lock engaged until it has been reconciled against the venue. Treating a timeout as a failure is how strategies double-enter.
 10. **Never trade on history.** Backfilled bars carry `replay=True`. They update market state, but strategies and the OPM refuse to act on them.
 11. **Locks are acquired synchronously at the moment of decision.** `try_begin_entry` / `try_begin_exit` are check-and-set calls with no `await` in between, so exactly one decision can win.
+12. **A halt latches, escalates only, and is released only by the operator, by halt id.** Every state change that defines a halt (closing the gate, opening it again together with the drawdown re-baseline) happens before the first `await`, so no event can be evaluated against a half-applied halt. The halt is persisted before it is announced and survives restarts.
+13. **A restart resumes; it never forgets.** Positions, sub-lot residuals, open trades, working orders, locks, halts and drawdown peaks are rebuilt from the store (and reconciled with any venue that outlived the process) before the bus runs. State the system cannot vouch for starts the mode halted (`HALT_ENTRIES`).
 
 ---
 
@@ -124,7 +132,10 @@ trading_infrastructure/
 | Routing is per strategy (`STRATEGY_REGISTRY`) | Promotion path SIM → small LIVE → full LIVE | Ledgers/reconciliation must stay per mode |
 | Binance fills by **polling** (`query` + `myTrades`) | Simple and robust on both testnet and live | Add a user-data stream when latency matters |
 | Quote stream **bypasses the bus** | bookTicker/aggTrade run at hundreds of msgs/s per symbol; the bus is the critical path | — |
-| Sub-lot residuals ("dust") are **carried on the ledger**, not sized away by predicting fees | Rounding makes dust unavoidable whatever the fee; fees vary by tier, BNB, promotion, maker/taker and venue (§8.1) | Residuals are not rehydrated after a restart yet (§14) |
+| Sub-lot residuals ("dust") are **carried on the ledger**, not sized away by predicting fees | Rounding makes dust unavoidable whatever the fee; fees vary by tier, BNB, promotion, maker/taker and venue (§8.1) | — (rehydrated across restarts since v4) |
+| Kill-switch **policy in the core, venue specifics behind the port** | A venue that "sold everything" itself would bypass the OMS: its fills would never reach the ledgers. The flatten goes through the normal pipeline as `FLATTEN` intents | Venues with trading hours need a "flatten pending until open" state |
+| **One risk book per execution mode** | A paper (SIM) loss must never halt real (LIVE) money | Multi-currency books need FX conversion |
+| Operator control by **two files**: `kill_switch.ini` (you) / `kill_switch_status.txt` (system) | One writer per file; works over SSH; a reset must quote the halt id, so a stale value can never release a new halt | Telegram `/halt` later (§14) |
 | Floats in the domain, **Decimal at the exchange boundary** | Simplicity; rounding is where float error bites | Move ledgers to Decimal/int ticks before real size |
 | Spot semantics (no shorting) | The venue is Binance Spot | Futures needs a new venue and margin model |
 | Placeholder features/exits use RNG | MVP plumbing soak test | Replace with `data/features.py` and `opm/engines.py` |
@@ -152,7 +163,8 @@ The bus is a single `asyncio.PriorityQueue` of `(priority, seq, event)`. `seq` i
 | −20 | `store.save_bar` (lambda in main) | persist the raw bar |
 | −15 | `sim_venue.on_bar` (lambda in main) | simulator degraded mode |
 | −10 | `OpenPositionManager.on_params_ready` | **exits outrank entries** on every bar |
-| 0 | strategies, OMS, DataProcessor, everything else | default |
+| 0 | strategies, OMS, DataProcessor, KillSwitchController (`RiskBreach`), everything else | default |
+| 50 | `RiskSupervisor` (`BarClosed`, `Position*`) | marks AFTER the DataProcessor updated the close and after the lock/OPM reacted |
 | 100 | `print_telemetry` | log last |
 
 Handlers are resolved over the event's class hierarchy (MRO), so subscribing to `OrderEvent` or `Event` receives every subclass.
@@ -171,8 +183,10 @@ Handlers are resolved over the event's class hierarchy (MRO), so subscribing to 
 | `OrderCanceled` / `OrderExpired` / `OrderRejected` | `order`, `reason` | OMS | Lock | HIGH |
 | `OrderStatusUnknown` | `order`, `reason` | OMS | Lock (stays pending) | HIGH |
 | `PositionOpened` / `PositionChanged` / `PositionClosed` | `position: Position` (+ delta / realized PnL; on close `position.residual_quantity` is the sub-lot leftover) | PortfolioManager | Lock, OPM | HIGH |
-| `RiskBreach` | `rule_name, symbol, detail` | OMS (vanished order) | Journal | CRITICAL |
-| `SignalGenerated`, `ResizeRequest`, `KillSwitch`, `Heartbeat` | — | *planned* | — | — |
+| `RiskBreach` | `rule_name, symbol, detail, mode?` | OMS (vanished order) | Journal, KillSwitchController (→ `HALT_ENTRIES`) | CRITICAL |
+| `KillSwitch` | `mode, level, previous_level, halt_id, source, reason` | KillSwitchController (every level change) | (informational; the controller enforces) | CRITICAL |
+| `IntentIssued(FLATTEN)` | `intent` | KillSwitchController (`HALT_COMPLETE`) | Journal, Lock (audit), OMS | CRITICAL |
+| `SignalGenerated`, `ResizeRequest`, `Heartbeat` | — | *planned* | — | — |
 
 ---
 
@@ -196,6 +210,22 @@ stateDiagram-v2
 - **Settling** happens only on terminal facts. The resting state is then *derived*: a position exists → HOLDING; working orders remain → PENDING_ENTRY; otherwise → IDLE. Position truth comes from `PortfolioManager.get_position` (rule 5).
 - **`OrderStatusUnknown` never settles**, so the strategy cannot double-enter while an order's fate is unknown.
 - **"Flat" means below one lot step.** A sub-lot residual left by fees never holds the lock (§8.1).
+
+### Halt level — one per execution mode (`risk/kill_switch.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> NONE
+    NONE --> HALT_ENTRIES: RiskBreach / rehydration problem / operator
+    NONE --> HALT_COMPLETE: drawdown rule / operator
+    HALT_ENTRIES --> HALT_COMPLETE: drawdown rule / operator (escalation)
+    HALT_ENTRIES --> NONE: operator reset (halt id)
+    HALT_COMPLETE --> NONE: operator reset (halt id)
+```
+
+- **HALT_ENTRIES:** the OMS rejects every entry with `IntentRejected(stage=HALTED)`. Strategies keep running, so every signal is still journaled (`intents.outcome = REJECTED:HALTED`). Working orders run their course: **a resting entry can still fill**. The OPM keeps managing exits.
+- **HALT_COMPLETE:** as above, plus the flatten loop: cancel every working order of the mode, then `FLATTEN` (MARKET, no risk rule) every system-attributed position, repeating until nothing works and nothing is held above one lot step. Then `flattened_at` is recorded and the venue's balances are checked. Exposure that reappears (an UNKNOWN order resolving to FILLED) is flattened again.
+- **Never automatic downwards.** A reset re-baselines both drawdown peaks to the current equity: the operator has accepted the loss.
 
 ### Order lifecycle — owned by the OMS (`messages/model.OrderStatus`, `execution/oms._apply_update`)
 
@@ -229,15 +259,16 @@ How the OMS decides the effective status on each venue update:
 ## 6. Runtime sequences
 
 ### 6.1 Startup (`main.main`)
-1. `settings.validate()`: fail loudly if a LIVE or TESTNET strategy lacks keys.
-2. `SqliteStore.start()`: create or verify schema v3 (WAL) and launch the writer task. A file from an older schema aborts startup.
+1. `settings.validate()`: fail loudly if a LIVE or TESTNET strategy lacks keys, or a routed mode has no `RISK_CAPITAL`.
+2. `SqliteStore.start()`: create or verify schema v4 (WAL), **migrating a v3 file in place** (history kept), and launch the writer task. A file with no migration path aborts startup.
 3. `load_instruments()`: mainnet `exchangeInfo` → `InstrumentRegistry` (falls back to `default_spec`).
 4. Build the venues (`SimulatedVenue` always; `BinanceVenue` per TESTNET/LIVE mode in use) and the `VenueRouter`.
-5. Build the core: `DatabaseJournal`, `PortfolioManager`, `LockManager(position_view=portfolio.get_position)`, `DataProcessor`, `OpenPositionManager`, `PreTradeRiskManager(rules)`, `OrderManagementSystem`, strategies. Abort if any strategy id is missing from `STRATEGY_REGISTRY`.
+5. Build the core: `DatabaseJournal`, `PortfolioManager`, `LockManager(position_view=portfolio.get_position)`, `DataProcessor`, `OpenPositionManager`, `PreTradeRiskManager(rules)`, `OrderManagementSystem`, `KillSwitchController` (then `oms.halt_view = kill_switch.level`), `RiskSupervisor`, strategies. Abort if any strategy id is missing from `STRATEGY_REGISTRY`.
 6. Subscribe the glue: `save_bar`, `sim.on_bar`, telemetry.
 7. `WarmupLoader.heal_gaps()`: REST-fill internal and trailing gaps over the last `MAX_BACKFILL_HOURS`, then `flush()`. Then `warm()`: load `MAX_LOOKBACK` bars into each window.
-8. Start the venues and the OMS poller, then create tasks for `bus.run()`, `feed.start()` and `quotes.start()`.
-9. Wait for a stop signal or for any core task to die.
+8. Start the venues, then **`Rehydrator.run()`** (§6.9) while the bus is still stopped.
+9. `kill_switch.start()` (reads `config/kill_switch.ini` once, so a manual halt applies before the first bar), the OMS poller, then tasks for `bus.run()`, `feed.start()` and `quotes.start()`.
+10. Wait for a stop signal or for any core task to die.
 
 ### 6.2 Entry → fill → position (the happy path)
 
@@ -290,14 +321,38 @@ Registry, routing, validation, risk or an exception → `IntentRejected(stage)` 
 ### 6.6 Websocket reconnect
 `BinanceFeed` reconnects with backoff, then `_backfill_gaps()` fetches **closed** bars after the last published start time and publishes them with `replay=True`. They warm the windows; strategies and the OPM ignore them. Duplicates are dropped by both the feed (`_last_start_ms`) and `RollingWindow.append`.
 
+**Live hole-filling (no disconnect).** If a live closed bar arrives more than one interval after the last bar of its symbol (a lost message), `_heal_live_gap()` REST-fetches the missing closed bars and publishes them as `replay=True` **before** the live bar (anything the endpoint returns at or after the live bar is dropped, so history can never shadow the live decision). If the REST call fails, the bar is published anyway and the hole is logged; the `DataProcessor` also warns on any non-contiguous append.
+
 ### 6.7 Shutdown (`main.shutdown`; runs on SIGINT/SIGTERM and on Windows Ctrl+C, which cancels the main task)
-1. Stop the feed and the quote stream.
+1. Stop the feed and the quote stream, then `kill_switch.stop()` (an active halt stays latched in the store).
 2. `oms.stop()`: cancel the poller and wait up to 10 s for in-flight venue calls.
 3. `bus.drain()` (up to 10 s), then `bus.stop()` (the sentinel), then wait for the bus task.
 4. Cancel the remaining tasks, stop the venues, close the REST session.
 5. **Always** `store.stop()`, which flushes the write queue.
 
-Resting orders at the venue are deliberately left untouched.
+Resting orders at the venue are deliberately left untouched. Restarting is safe at any time: §6.9.
+
+### 6.8 Kill switch
+1. A trigger calls `kill_switch.trigger(mode, level, source, reason)`. The episode (`HaltRecord`) is set in memory **first** (the OMS gate closes immediately), then persisted durably to `halts`, then announced (`KillSwitch` event, status file).
+2. `HALT_COMPLETE` starts the per-mode flatten loop (every `KILL_SWITCH_FLATTEN_RETRY_SECONDS`): `oms.cancel_all_working(mode)` (never stacks a cancel already in flight); for every open position whose lock is HOLDING, `try_begin_exit` + `IntentIssued(FLATTEN, MARKET, CRITICAL)`; a position whose order is still working waits for the next round. The OMS runs a FLATTEN through reduce-only and clamping but **no risk rule**.
+3. When nothing works and nothing is held: `flattened_at`, then a venue check (the venue must hold at least the ledgers' sub-lot residuals; exactly, for the simulator).
+4. The operator resets by writing `reset = <halt id>` (and `halt = NONE` if the halt was manual) in `config/kill_switch.ini`. The controller opens the gate and the RiskSupervisor re-baselines its peaks **in the same synchronous step**, then persists `cleared_at`.
+
+### 6.9 Restart rehydration (`state/rehydration.py`, before the bus runs)
+1. `kill_switch.load()`: open halt episodes come back (the latch survives).
+2. `portfolio.rehydrate()`: a ledger whose newest trade is CLOSED holds that trade's residual at its residual price; an OPEN trade is **replayed** from its carried-in residual through its fill legs with the live arithmetic (`_ledger_step`), then checked against the `positions` and `trades` rows. Closed-trade totals and metrics are reloaded.
+3. Venues with `survives_restart = False` (the simulator) are restored with `restore_from_fills()`: initial balances + every recorded fill of that mode, so the account equals the ledgers exactly.
+4. `oms.rehydrate()`: working orders are rebuilt from their last snapshot and fills. On a surviving venue they stay working (PENDING_SUBMIT becomes UNKNOWN) and each is queried once; on the simulator they are closed as CANCELED. An order whose intent row is missing is still rebuilt (kind from its client order id) and reported.
+5. `lock.rehydrate()` and `opm.rehydrate()` derive their state from the restored positions and working orders.
+6. Venue check: every venue must hold at least what the ledgers attribute to the system (exactly, for the simulator).
+7. `supervisor.rehydrate()`: each book's trailing window and high-water mark from `portfolio_equity` since the last reset.
+8. Any integrity problem halts the affected mode(s) at `HALT_ENTRIES`; nothing new is opened on state the system cannot vouch for, while existing positions stay managed.
+
+### 6.10 Portfolio risk (`risk/supervisor.py`)
+On every bar (live or replay) and every `Position*` event, per execution mode: `equity = capital + Σ total_pnl` over the mode's (strategy, symbol) pairs, where `total_pnl = realized (net of fees) + quantity × (latest close − average entry)`. The unmarked totals come from `PortfolioManager.pnl_at_cost()`, which changes only inside the portfolio's synchronous fill mutation, so a closing trade is never counted twice or not at all. Rules, both → `HALT_COMPLETE`:
+- `drawdown_window`: equity ≥ `RISK_MAX_DRAWDOWN_WINDOW` (5 %) below its **peak within the trailing `RISK_DRAWDOWN_WINDOW_HOURS` (24 h)**: peak-to-now, so a rally given back inside the window counts.
+- `drawdown_hwm`: equity ≥ `RISK_MAX_DRAWDOWN_HWM` (10 %) below its all-time high-water mark: the slow-bleed backstop a rolling window cannot see.
+On every **live** bar close of a symbol it writes one `strategy_pnl` row per pair on that symbol and one `portfolio_equity` row per book (§8.3).
 
 ---
 
@@ -315,8 +370,9 @@ enum OrderType       MARKET | LIMIT | STOP_LOSS | STOP_LOSS_LIMIT | TAKE_PROFIT 
 enum TimeInForce     GTC | IOC | FOK
 enum OrderStatus     PENDING_SUBMIT | NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN
                      + is_terminal  (FILLED, CANCELED, REJECTED, EXPIRED)
-enum IntentKind      OPEN | CLOSE | SCALE_IN | SCALE_OUT | FLATTEN   + is_entry, + is_exit
-enum RejectStage     REGISTRY | ROUTING | VALIDATION | RISK | EXCEPTION
+enum IntentKind      OPEN | CLOSE | SCALE_IN | SCALE_OUT | FLATTEN   + is_entry, + is_exit, + code / from_code (O C I U F)
+enum RejectStage     REGISTRY | ROUTING | VALIDATION | RISK | HALTED | EXCEPTION
+enum HaltLevel       NONE < HALT_ENTRIES < HALT_COMPLETE (IntEnum, per execution mode, escalate only)
 enum ManagementAction HOLD | CLOSE | MOVE_STOP | RESIZE        (planned)
 
 frozen Bar             symbol, venue, interval, start_time, close_time, open, high, low, close, volume, is_closed
@@ -343,6 +399,11 @@ frozen Position        strategy_id, symbol, venue, mode, quantity (SIGNED), aver
 frozen TradeRecord     one `trades` row: identity, direction, status, entry/exit qty + VWAP, max_quantity,
                        carried_in_* / residual_*, gross/fees/realized PnL, entry/exit time + intent,
                        exit_reason, entry/exit_ref_price, mae, mfe   + holding_ms   (§8.2)
+frozen HaltRecord      halt_id, mode, level, source, reason, triggered_at, escalated_at?, flattened_at?, cleared_at?, clear_detail?
+frozen StrategyPnL     timestamp, mode, strategy_id, symbol, position_qty, avg_entry_price, mark_price?, realized_pnl,
+                       unrealized_pnl, total_pnl, fees_paid, closed_trades, winning_trades
+frozen EquitySnapshot  timestamp, mode, capital, total_pnl, equity, peak_window, high_watermark, drawdown_window,
+                       drawdown_hwm, halt_level
 frozen PositionView    quantity, average_entry_price, bars_held      (planned, for Strategy.manage)
 + utc_now() -> aware UTC datetime        + new_id() -> uuid4 hex
 ```
@@ -382,11 +443,12 @@ class EventBus
 ### 7.3 `connectors/` — ports and adapters
 
 ```text
-«port» ExecutionVenue            venue_id, mode, needs_polling
+«port» ExecutionVenue            venue_id, mode, needs_polling, survives_restart
   + start() / stop() / set_update_handler(async cb(VenueOrderUpdate))
   + submit(OrderRequest) -> VenueOrderUpdate        raises VenueUnknownOutcome if unsure
   + cancel(symbol, coid) -> VenueOrderUpdate | None  None = unknown order
   + query(symbol, coid)  -> VenueOrderUpdate | None  None = does not exist
+  + fetch_balances() -> {asset: free + locked}       whole account; raises when unknown
 «port» MarketDataFeed            + start() / stop()
 «port» HistoricalBarSource       + fetch_bars(symbol, interval, start_ms, end_ms?) -> [Bar]
 exception VenueUnknownOutcome
@@ -414,18 +476,20 @@ class BinanceFeed                    «MarketDataFeed»   «pub» BarClosed
 class BinanceQuoteStream             bookTicker (+aggTrade) -> QuoteSink callbacks (NOT the bus)
 «protocol» QuoteSink                 on_book_ticker(sym, bid, bid_qty, ask, ask_qty), on_trade(sym, px, qty, is_buyer_maker)
 
-class BinanceVenue                   «ExecutionVenue» mode TESTNET|LIVE, needs_polling=True
+class BinanceVenue                   «ExecutionVenue» mode TESTNET|LIVE, needs_polling=True, survives_restart=True
   - _session, current_weight, _backoff_until
   + submit / cancel / query          see class docstring for the outcome classification
+  + fetch_balances()                 GET /api/v3/account (codec.balances_from_account)
   - _guard()  refuse (not send) under back-off or weight budget
   - _signed(method, path, params)    HMAC-SHA256, recvWindow, timestamp
 ```
 
 ```text
-class SimulatedVenue                 «ExecutionVenue» mode SIM, needs_polling=False   (see §10)
+class SimulatedVenue                 «ExecutionVenue» mode SIM, needs_polling=False, survives_restart=False   (see §10)
   + on_book_ticker / on_trade / on_bar     market-data inputs (sync)
-  + submit / cancel / query                port (async, simulated latency)
+  + submit / cancel / query / fetch_balances   port (async, simulated latency)
   + balances() -> {asset: {free, locked}}
+  + restore_from_fills(fills)              rehydration: initial balances + recorded fills
   - _accept, _walk, _execute_market, _execute_limit, _match_on_book, _match_on_trade,
     _match_on_bar, _trigger_stops, _lock, _release, _settle, _close, _emit, _dispatch_loop
 class SimConfig                      all knobs (balances, fees, latency, staleness, depth model, rate limit, seed)
@@ -466,6 +530,8 @@ class LockManager(bus, position_view?)
   - _slots: Dict[(sid, sym), _Slot(state, pending_intent_id, working:set, has_position)]
   + state / can_strategy_enter / can_opm_manage
   + try_begin_entry(intent) -> bool / try_begin_exit(intent) -> bool      synchronous CAS
+  + rehydrate(positions, working_orders)     startup: exit working -> PENDING_EXIT, position -> HOLDING,
+                                             entry working -> PENDING_ENTRY, else IDLE
   «sub» IntentIssued(audit), IntentRejected, OrderEvent(-40), PositionOpened, PositionClosed
   - _settle(): HOLDING if position, PENDING_ENTRY if working orders, else IDLE
 
@@ -473,6 +539,7 @@ class OpenPositionManager(bus, lock_manager, strategy_evaluators?)
   - _active_positions: Dict[(sid, sym), Position]   - _bars_held: Dict[(sid, sym), int]
   «sub» Position*  (mirror), ParamsReady(order -10)
   «pub» IntentIssued(CLOSE, MARKET, priority HIGH)
+  + rehydrate(positions)  startup: mirror open positions; bars held = whole intervals since opened_at
   + on_params_ready(e)    per open position on that symbol: skip replay / not HOLDING ->
                           ROUTE A strategy evaluator | ROUTE B _independent_risk_check -> _trigger_exit
 ```
@@ -486,7 +553,24 @@ abstract class RiskRule       applies_to_exits=False, name, evaluate(intent, req
   DuplicateIntentRule(window_s)     same (kind, side, type, qty, price) per (sid, sym) within the window
   RandomMockRejectionRule(p)        soak test, entries only
 class PreTradeRiskManager(rules)    + validate(intent, request, market_state) -> RiskVerdict(approved, rule_name, detail)
+                                    FLATTEN runs no rule (a kill switch a rule can block is not one)
 + reference_price(request, market_state)   limit price or market_state["close"]
+
+class KillSwitchController(bus, store, oms, portfolio, lock, router, instruments, market_view, modes,
+                           control_path, status_path)            risk/kill_switch.py   «sub» RiskBreach
+  - _active: Dict[mode, HaltRecord]   - _last_clear: Dict[mode, datetime]   - _flatteners: Dict[mode, Task]
+  + level(mode) -> HaltLevel         synchronous: the OMS entry gate (oms.halt_view)
+  + trigger(mode, level, source, reason) -> bool     open / escalate; never lowers
+  + reset(halt_id, detail) -> bool   operator release; reset listeners run before any await
+  + add_reset_listener(cb) / last_reset(mode) / active(mode)
+  + load() / start() / stop() / poll_control_file()
+  «pub» KillSwitch, IntentIssued(FLATTEN, CRITICAL)   writes: halts, kill_switch_status.txt
+
+class RiskSupervisor(bus, store, pnl_at_cost, market_view, kill_switch, capital{mode: float},
+                     window_hours, max_drawdown_window, max_drawdown_hwm)   risk/supervisor.py
+  «sub» BarClosed(50), PositionOpened/Changed/Closed(50)   writes: strategy_pnl, portfolio_equity
+  - _books: Dict[mode, _Book(capital, monotonic window deque, hwm, last)]
+  + evaluate() -> {mode: EquitySnapshot}  /  marked_pnl() -> [StrategyPnL]  /  rebaseline(mode)  /  rehydrate()
 ```
 
 ### 7.8 `execution/`
@@ -495,12 +579,16 @@ class PreTradeRiskManager(rules)    + validate(intent, request, market_state) ->
 class Order (mutable, OMS-private)  status, filled_quantity, average_price, cumulative_fee, venue_order_id,
                                     version, seen_trade_ids, not_found_count   + snapshot() -> OrderSnapshot
 class OrderManagementSystem(bus, store, router, strategy_registry, risk_manager, instruments,
-                            market_view, position_view, poll_interval=3.0, unknown_resolution_seconds=30.0)
+                            market_view, position_view, poll_interval=3.0, unknown_resolution_seconds=30.0,
+                            halt_view?)
   - _orders: Dict[coid, Order]   working only      - _tasks   - _poll_task
+  - _reconcile: rehydrated orders to query once     - _cancelling: cancels in flight (never stacked)
   «sub» IntentIssued, CancelIssued     «push» venue.set_update_handler(_on_venue_push)
   «pub» IntentRejected, Order*, RiskBreach
   + start() / stop(timeout) / working_orders()
-  - _process_intent   registry -> route -> instrument -> reduce-only -> round -> risk -> write-ahead -> spawn
+  + cancel_all_working(mode) -> int        kill switch (every non-FLATTEN working order)
+  + rehydrate(entries) -> [problem]        startup
+  - _process_intent   registry -> route -> HALT GATE (entries) -> instrument -> reduce-only -> round -> risk -> write-ahead -> spawn
   - _submit / _cancel / _poll_loop / _poll_one / _mark_unknown          background venue work
   - _apply_update     THE mutator: dedupe fills, effective status, per-fill snapshots, persist, publish
 class VenueRouter      + register(venue) / venue_for(mode) / all()
@@ -510,11 +598,15 @@ class VenueRouter      + register(venue) / venue_for(mode) / all()
 ### 7.9 `state/` and `ops/`
 
 ```text
-class SqliteStore(db_path, schema_path, max_batch=500)      single writer task, WAL, schema v3
-  + start / stop (flushes) / flush
+class SqliteStore(db_path, schema_path, max_batch=500)      single writer task, WAL, schema v4, MIGRATIONS
+  + start (migrates) / stop (flushes) / flush
   + save_bar(s) / upsert_order(snap, durable) / record_fill / save_position / save_trade /
-    link_trade_fill / log_intent / resolve_intent / log_risk_event
+    link_trade_fill / log_intent / resolve_intent / log_risk_event / save_halt (durable) /
+    save_strategy_pnl / save_equity
   + get_recent_bars / get_bar_start_times / get_latest_bar_time
+  + rehydration reads: get_latest_trades / get_trade_legs / get_open_position_rows / get_closed_trade_stats /
+    get_closed_trades / get_working_orders (domain objects) / get_fills_for_mode / get_halts /
+    get_equity_history / get_max_total_pnl
 + to_ms(aware dt) / from_ms(ms)       exception SchemaMismatchError
 
 class PortfolioManager(bus, instruments, store?)    «sub» OrderPartiallyFilled, OrderFilled (order -50), BarClosed
@@ -524,7 +616,12 @@ class PortfolioManager(bus, instruments, store?)    «sub» OrderPartiallyFilled
   «pub» PositionOpened / PositionChanged / PositionClosed
   + apply_fill(order_snapshot, fill)   splits a flip-through-zero fill into two legs (two trades)
   + get_position (None below one lot step) / get_open_positions / get_residual / net_quantity (incl. residuals)
-  + get_strategy_metrics
+  + get_strategy_metrics / ledgers() (incl. residuals)
+  + pnl_at_cost() -> [StrategyPnL]     per (mode, sid, sym): closed totals + open ledger, unmarked, atomic
+  + rehydrate() -> [problem]           startup (§6.9); _ledger_step is the shared ledger arithmetic
+
+class Rehydrator(store, portfolio, oms, lock, opm, router, instruments, kill_switch, supervisor)
+  + run() -> {mode | None: [problem]}  state/rehydration.py, §6.9
 class PerformanceMetrics    total_closed, winners, losers, gross_profit, gross_loss  + win_rate, avg_winner, avg_loser
 
 class DatabaseJournal(bus, store)   «sub» IntentIssued(-200), IntentRejected, RiskBreach
@@ -535,24 +632,28 @@ class DatabaseJournal(bus, store)   «sub» IntentIssued(-200), IntentRejected, 
 - **main:** `load_instruments()`, `main()`, `shutdown()`. Construction order is §6.1.
 - **tools/audit_db.py:** read-only row counts and kline continuity (`python -m tools.audit_db [hours]`).
 - **tools/reconcile_trades.py:** rebuilds every trade from the fills and checks the journal (`python -m tools.reconcile_trades [db]`, exit code 1 on failure; §8.2).
+- **tools/strategy_report.py:** read-only scorecard per (mode, strategy, symbol), the books' equity and drawdowns, and active halts (`python -m tools.strategy_report [db]`).
 - **tests:** see §12.
 
 ---
 
-## 8. Persistence and accounting (`state/schema.sql`, schema version 3)
+## 8. Persistence and accounting (`state/schema.sql`, schema version 4)
 
-Every timestamp is **INTEGER epoch milliseconds (UTC)**. `PRAGMA user_version = 3`. An older file aborts startup with `SchemaMismatchError` (archive it and restart).
+Every timestamp is **INTEGER epoch milliseconds (UTC)**. `PRAGMA user_version = 4`. A v3 file is **migrated in place** at startup (`MIGRATIONS` in `state/stores.py`: additive only, history kept). A file with no migration path aborts startup with `SchemaMismatchError` (archive it and restart).
 
 | Table | Key | Writer | Contents |
 |---|---|---|---|
 | `klines` | (symbol, interval, start_time) | store via `BarClosed` / warm-up | OHLCV, upserted |
-| `intents` | intent_id | Journal inserts; OMS sets `outcome` | every decision + `ORDERED` / `REJECTED:<stage>` |
+| `intents` | intent_id | Journal inserts; OMS sets `outcome` | every decision + `ORDERED` / `REJECTED:<stage>` (incl. `REJECTED:HALTED`) + `reference_price` (v4) |
 | `orders` | client_order_id | **OMS only** | full order row; `version` guard prevents regressions |
 | `fills` | (client_order_id, exchange_trade_id) | OMS | immutable executions (`INSERT OR IGNORE`) |
 | `positions` | (strategy_id, symbol, opened_at) | **PortfolioManager only** | one row per position lifetime, OPEN → CLOSED; `trade_id` links to `trades` |
 | `risk_ledger` | autoincrement | Journal | `REJECT_INTENT:<stage>` and `BREACH` rows |
 | `trades` | trade_id | **PortfolioManager only** | the historical journal: one row per round trip (§8.2) |
 | `trade_fills` | (trade_id, client_order_id, exchange_trade_id) | **PortfolioManager only** | which fill (or fill leg) belongs to which trade |
+| `halts` | halt_id | **KillSwitchController only** | one row per kill-switch episode and mode; `cleared_at` NULL while active (§8.3) |
+| `strategy_pnl` | (mode, strategy_id, symbol, timestamp) | **RiskSupervisor only** | PnL per pair at every live bar close (§8.3) |
+| `portfolio_equity` | (mode, timestamp) | **RiskSupervisor only** | each book's equity, peaks, drawdowns and halt level at every live bar close (§8.3) |
 
 The full story of a trade is reconstructable by joining on ids: `trades` → `trade_fills` → `fills` → `orders` → `intents` (on `intent_id`), and `positions` on `trade_id`.
 
@@ -605,12 +706,25 @@ SELECT trade_id, (avg_entry_price - entry_ref_price) * CASE direction WHEN 'LONG
 FROM trades WHERE entry_ref_price IS NOT NULL;
 ```
 
+### 8.3 Risk tables (v4): `halts`, `strategy_pnl`, `portfolio_equity`
+- **`halts`**: `halt_id` (e.g. `SIM-20261012-081500-a1b2`), `mode`, `level` (highest reached), `source` (`manual`, `drawdown_window`, `drawdown_hwm`, `rehydration`, `breach:<rule>`), `reason`, `triggered_at`, `escalated_at`, `flattened_at`, `cleared_at`, `clear_detail`. Persisted durably before the halt is announced.
+- **`strategy_pnl`**: per (mode, strategy, symbol) at each live bar close of the symbol: `position_qty` (residual included), `avg_entry_price`, `mark_price`, cumulative `realized_pnl` (net of fees), `unrealized_pnl`, `total_pnl`, cumulative `fees_paid`, `closed_trades`, `winning_trades`. Tracking starts with v4; earlier closed trades are included in the cumulative columns from the first row.
+- **`portfolio_equity`**: per mode at each live bar close: `capital`, `total_pnl`, `equity`, `peak_window`, `high_watermark`, `drawdown_window`, `drawdown_hwm` (fractions), `halt_level`. The supervisor rebuilds its peaks from this table after a restart.
+
+```sql
+-- which strategy is under-performing on which asset (latest row per pair)
+SELECT mode, strategy_id, symbol, closed_trades, winning_trades, realized_pnl, unrealized_pnl, total_pnl, fees_paid
+FROM strategy_pnl p WHERE timestamp = (SELECT MAX(timestamp) FROM strategy_pnl q
+  WHERE q.mode = p.mode AND q.strategy_id = p.strategy_id AND q.symbol = p.symbol)
+ORDER BY total_pnl;
+```
+
 ---
 
 ## 9. Concurrency model
 
 - **One process, one asyncio event loop.** There are no threads apart from `asyncio.to_thread` for feature maths and aiosqlite's worker.
-- **Long-lived tasks:** `bus.run`, `BinanceFeed.start`, `BinanceQuoteStream.start`, `SqliteStore._writer_loop`, `OMS._poll_loop`, `SimulatedVenue._dispatch_loop`. Short-lived tasks: OMS `_submit` / `_cancel` per order.
+- **Long-lived tasks:** `bus.run`, `BinanceFeed.start`, `BinanceQuoteStream.start`, `SqliteStore._writer_loop`, `OMS._poll_loop`, `SimulatedVenue._dispatch_loop`, `KillSwitchController._poll_loop` (control file) and, while `HALT_COMPLETE`, one `_flatten_loop` per mode. Short-lived tasks: OMS `_submit` / `_cancel` per order.
 - **Atomicity rule:** code between two `await`s cannot be interleaved. Every state transition is written as a synchronous block (`try_begin_*`, `_apply_update` mutation, `apply_fill` mutation, every simulator matching method), and awaits (persist, publish) come after the mutation.
 - **Where the bus loop awaits:** feature maths (`to_thread`), the OMS write-ahead commit (one local SQLite commit), and queue puts. Never the network.
 - **Backpressure:** the bus queue is unbounded; `bus.depth` is the metric to watch. Never bound it without moving publishes out of handlers, or a handler publishing to a full queue deadlocks the loop.
@@ -633,6 +747,7 @@ A Binance-Spot-like matching engine driven by live mainnet `bookTicker` and `agg
 | Fees | taker/maker rates, charged in the received asset (Binance without BNB) |
 | Degraded mode | without live quotes, bars synthesize a book (close ± half-spread) and resting/stop orders use bar high/low (gaps fill at the open) |
 | Safety | stale market data → reject, never fill blind |
+| Restarts | in-memory (`survives_restart = False`): rehydration rebuilds the balances from the fills ledger and cancels orders that were working; trade/order ids carry a per-process tag, so they never repeat |
 
 ---
 
@@ -650,22 +765,29 @@ A Binance-Spot-like matching engine driven by live mainnet `bookTicker` and `agg
 | `SIM_*` | 10k USDT, 0.1 % fees, 40 ms | simulator account |
 | `RISK_MAX_ORDER_NOTIONAL` | 5000 | fat-finger ceiling |
 | `RISK_MOCK_REJECTION_PROBABILITY` | 0.20 | soak-test rejections (entries only) |
-| `.env` keys | `BINANCE_TESTNET_API_KEY/SECRET`, `BINANCE_LIVE_API_KEY/SECRET`, optional `DB_PATH`, `LOG_PATH` | only needed for TESTNET / LIVE |
+| `RISK_CAPITAL` | SIM = `SIM_INITIAL_BALANCES["USDT"]`, TESTNET 10k, **LIVE 0** | each book's capital (system allocation, quote currency); every routed mode needs > 0 (`validate()`) |
+| `RISK_DRAWDOWN_WINDOW_HOURS` / `RISK_MAX_DRAWDOWN_WINDOW` | 24 / 0.05 | peak-to-now rule → `HALT_COMPLETE` |
+| `RISK_MAX_DRAWDOWN_HWM` | 0.10 | high-water-mark backstop → `HALT_COMPLETE` |
+| `KILL_SWITCH_DIR` | `<root>/config` | folder of `kill_switch.ini` / `kill_switch_status.txt` (env-overridable) |
+| `KILL_SWITCH_POLL_SECONDS` / `KILL_SWITCH_FLATTEN_RETRY_SECONDS` | 2 / 3 | control file poll / flatten round interval |
+| `.env` keys | `BINANCE_TESTNET_API_KEY/SECRET`, `BINANCE_LIVE_API_KEY/SECRET`, optional `DB_PATH`, `LOG_PATH`, `KILL_SWITCH_DIR` | only needed for TESTNET / LIVE |
 
 ---
 
 ## 12. Testing
 
-Run with `python -m unittest discover -s tests -t .`. The suite needs no network and runs in about 4 s.
+Run with `python -m unittest discover -s tests -t .`. The suite needs no network and runs in about 8 s.
 
 | File | Proves |
 |---|---|
-| `tests/helpers.py` | `System` fixture: the full core wired on a zero-latency `SimulatedVenue` with a temp DB; `Recorder` captures every event |
+| `tests/helpers.py` | `System` fixture: the full core wired like `main.py` (journal, OPM, kill switch, supervisor, rehydration) on a zero-latency `SimulatedVenue` with a temp DB; `System(db_dir=...)` **restarts** on a previous system's DB; `Recorder` captures every event |
 | `test_bus_and_lock.py` | priority + FIFO ordering, `order=` and base-class dispatch, stop sentinel, handler isolation; lock exclusivity, rollback, exit gating |
 | `test_pipeline.py` | full round trip with exact net-of-fees PnL; registry/risk/venue rejections release the lock; reduce-only; immutable per-fill snapshots; write-ahead and epoch-ms persistence; **lock transitions exactly IDLE→PENDING_ENTRY→HOLDING→PENDING_EXIT→IDLE**; timeout → UNKNOWN → reconciled (both outcomes) |
 | `test_sim_venue.py` | queue position, aggressor side, price improvement, IOC/FOK, book walking + consumed liquidity, filters/balances/duplicates, stop slippage, cancel releases funds, stale-data refusal, bar-only mode |
 | `test_trades.py` | **dust carry**: residual kept, valued and flat for trading; the next trade absorbs it and the ledger equals the venue balance across 15 round trips; trade rows (VWAPs, reference prices, MAE/MFE); a flip-through-zero fill split across two trades; `reconcile_trades` passes and catches a tampered row |
 | `test_market_data.py` | REST never returns the forming candle; backfill is replay and deduplicated; processor dedupe + replay propagation + read model; a burst of bars yields exactly one entry |
+| `test_rehydration.py` | an open position survives a restart (same row, lock HOLDING, no double entry, sim balances rebuilt) and closes cleanly; the residual chain survives a restart (reconcile: no warnings); a sim working order is canceled on restart; an order on a surviving venue that filled while down is reconciled; an integrity problem starts the mode halted; v3 → v4 migration keeps history; a live gap is healed as replay before the live bar; account balance parsing |
+| `test_kill_switch.py` | HALT_ENTRIES rejects (and journals) entries but exits run; HALT_COMPLETE cancels and flattens to the residual; a FLATTEN is never blocked by a risk rule; RiskBreach halts entries; control file: manual halt, reset only by the right id and only once `halt = NONE`, a stale id cannot release a new halt, garbage changes nothing; a halt survives restarts; window and high-water-mark drawdowns trip HALT_COMPLETE; a reset re-baselines (no re-trip); books are per mode; `strategy_pnl` / `portfolio_equity` rows on live bars only; PnL totals survive restarts |
 
 Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys needed) and inspect the results with `tools/audit_db.py`.
 
@@ -686,7 +808,7 @@ Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys neede
 
   Zero core changes.
 - **Promote a strategy:** SIM, then TESTNET (integration check), then LIVE with small size. Change only `STRATEGY_REGISTRY`; `validate()` enforces that the keys exist.
-- **Before any LIVE money:** build the kill switch / supervisor, startup reconciliation of open orders and positions, and lock rehydration (§14).
+- **Before any LIVE money:** set `RISK_CAPITAL[LIVE]`, rehearse a `HALT_COMPLETE` on TESTNET, and see manual Playbook G.
 
 ---
 
@@ -695,10 +817,10 @@ Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys neede
 | Item | Where | Notes |
 |---|---|---|
 | Allocator + CapitalBudget | `risk/allocator.py` | `Signal` → sized Intent (probability, vol, stop distance); `SignalGenerated` / `ResizeRequest` events already exist |
-| RiskSupervisor + KillSwitch | `risk/supervisor.py` | polls venues directly, persisted halt flag, cancel-all + flatten |
 | Exit engines + ExitContext | `opm/engines.py`, `opm/context.py` | Bracket, TrailingATR, Hysteresis, SafetyNet, StrategyDirected, Composite; replace the RNG in the OPM |
 | Feature library | `data/features.py` | pure functions + `FeatureSpec` declarations per strategy |
-| Restart rehydration | main startup | rebuild open orders, positions (incl. sub-lot residuals, §8.1), open trades and lock state from the store + venue truth |
+| Hard pre-trade caps | `risk/pretrade.py` | max position / gross exposure per symbol and account, orders-per-minute per strategy, stale-data refusal |
+| Per-strategy drawdown halts | `risk/supervisor.py` | halt one strategy instead of the whole mode (the per-pair PnL is already tracked) |
 | Binance user-data stream | `connectors/binance/user_stream.py` | replace polling; push via `set_update_handler` |
 | Telegram + Watchdog | `ops/telegram.py`, `ops/watchdog.py` | alerts, `/halt`, heartbeat staleness |
 | Decimal ledgers | `state/portfolio.py` | exact reconciliation against venue balances |
@@ -723,3 +845,5 @@ Live smoke testing: run `main.py` (public mainnet data, SIM venue, no keys neede
 | Exits subject to every risk rule | `applies_to_exits` opt-in | never block a risk-reducing order with an entry rule |
 | Fixed-format prices (`:.2f`) | tick/lot rounding via the registry | works for any symbol's filters |
 | Positions zeroed on close, sub-lot leftovers discarded | `trades` + `trade_fills` journal; residuals carried on the ledger (schema v3) | a historical record per trade; ledger = venue balance (§8.1, §8.2) |
+| RiskSupervisor + KillSwitch "polling venues directly" | supervisor marks the portfolio's own ledgers; kill switch flattens THROUGH the OMS (schema v4) | a flatten that bypassed the OMS would desynchronise the ledgers from the account |
+| Restart = start empty ("stop only when flat") | restart rehydration from store + venue (schema v4) | positions, residuals, orders, locks and halts must outlive the process |

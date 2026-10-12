@@ -7,12 +7,13 @@ from the project. If a type is used by two boxes, it lives here.
 
 Layout (in flow order):
   1. Enums           ExecutionMode, OrderSide, OrderType, TimeInForce, OrderStatus,
-                     IntentKind, ManagementAction, RejectStage
+                     IntentKind, ManagementAction, RejectStage, HaltLevel
   2. Market data     Bar -> MarketParams (-> Signal, planned allocator input)
   3. Commands        Intent (open/close/scale), CancelIntent, ManagementDecision (planned)
   4. Execution       OrderRequest (exchange-shaped), Fill (fact), OrderSnapshot (frozen view),
                      VenueOrderUpdate (what a venue port returns)
-  5. Accounting      Position (frozen ledger snapshot), PositionView (strategy-facing slice)
+  5. Accounting      Position (frozen ledger snapshot), TradeRecord, PositionView (strategy-facing slice)
+  6. Risk records    HaltRecord (kill-switch episode), StrategyPnL, EquitySnapshot
 
 Units: quantities are in BASE asset units (BTC for BTCUSDT); prices and money
 are in QUOTE asset units (USDT). Floats in the domain; exact Decimal rounding
@@ -35,7 +36,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum, auto
+from enum import Enum, IntEnum, auto
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
@@ -161,6 +162,19 @@ class IntentKind(Enum):
     def is_exit(self) -> bool:
         return self in (IntentKind.CLOSE, IntentKind.SCALE_OUT, IntentKind.FLATTEN)
 
+    @property
+    def code(self) -> str:
+        """The one-letter kind code embedded in client order ids (execution/order_ids.py)."""
+        return _INTENT_KIND_CODES[self]
+
+    @classmethod
+    def from_code(cls, code: str) -> Optional["IntentKind"]:
+        return next((k for k, c in _INTENT_KIND_CODES.items() if c == code), None)
+
+
+_INTENT_KIND_CODES = {IntentKind.OPEN: "O", IntentKind.CLOSE: "C", IntentKind.SCALE_IN: "I",
+                      IntentKind.SCALE_OUT: "U", IntentKind.FLATTEN: "F"}
+
 
 class ManagementAction(Enum):
     """PLANNED: actions an ExitEngine / Strategy.manage() can request for an open position."""
@@ -176,7 +190,22 @@ class RejectStage(Enum):
     ROUTING = auto()     # No venue for the strategy's execution mode
     VALIDATION = auto()  # Malformed / rounds to zero / nothing to close
     RISK = auto()        # Pre-trade risk rule fired
+    HALTED = auto()      # Kill switch engaged for the strategy's execution mode: no entries
     EXCEPTION = auto()   # Bug while processing - failed closed
+
+
+class HaltLevel(IntEnum):
+    """
+    Kill-switch level of one execution mode (risk/kill_switch.py). Ordered: a halt only
+    ever ESCALATES automatically; going back to NONE takes an operator reset.
+      NONE           trading normally
+      HALT_ENTRIES   no new entries; working orders run their course; exits allowed
+      HALT_COMPLETE  cancel every working order, flatten every system-attributed position,
+                     no entries; exits (incl. the flatten) allowed
+    """
+    NONE = 0
+    HALT_ENTRIES = 1
+    HALT_COMPLETE = 2
 
 
 # =====================================================================
@@ -504,6 +533,74 @@ class TradeRecord:
         if self.exit_time is None:
             return None
         return int((self.exit_time - self.entry_time).total_seconds() * 1000)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HaltRecord:
+    """
+    One kill-switch episode of one execution mode (`halts` table; written only by the
+    KillSwitchController). Opened by the first trigger, escalated in place, closed by the
+    operator quoting `halt_id` in config/kill_switch.ini.
+      level         the highest level reached in this episode
+      source        manual / drawdown_window / drawdown_hwm / rehydration / breach:<rule>
+      flattened_at  HALT_COMPLETE: when no system-attributed exposure or working order remained
+    """
+    halt_id: str
+    mode: ExecutionMode
+    level: HaltLevel
+    source: str
+    reason: str
+    triggered_at: datetime
+    escalated_at: Optional[datetime] = None
+    flattened_at: Optional[datetime] = None
+    cleared_at: Optional[datetime] = None
+    clear_detail: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StrategyPnL:
+    """
+    PnL of one (mode, strategy_id, symbol) pair at one instant (`strategy_pnl` table; written
+    only by the RiskSupervisor). Money in quote units; cumulative since the first trade.
+      position_qty / avg_entry_price   the ledger, sub-lot residual included
+      realized_pnl     closed trades + the open trade's realized part, net of fees
+      unrealized_pnl   position_qty * (mark_price - avg_entry_price)
+      total_pnl        realized + unrealized: this pair's contribution to its book's equity
+    """
+    timestamp: datetime
+    mode: ExecutionMode
+    strategy_id: str
+    symbol: str
+    position_qty: float
+    avg_entry_price: float
+    mark_price: Optional[float]
+    realized_pnl: float
+    unrealized_pnl: float
+    total_pnl: float
+    fees_paid: float
+    closed_trades: int
+    winning_trades: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EquitySnapshot:
+    """
+    One execution mode's book at one instant (`portfolio_equity` table; RiskSupervisor only).
+      equity           capital + sum of its pairs' total_pnl
+      peak_window      highest equity in the trailing drawdown window (since the last reset)
+      high_watermark   highest equity since inception (or the last reset)
+      drawdown_*       1 - equity / peak, as fractions (0.05 = 5 %)
+    """
+    timestamp: datetime
+    mode: ExecutionMode
+    capital: float
+    total_pnl: float
+    equity: float
+    peak_window: float
+    high_watermark: float
+    drawdown_window: float
+    drawdown_hwm: float
+    halt_level: HaltLevel
 
 
 @dataclass(frozen=True, slots=True)

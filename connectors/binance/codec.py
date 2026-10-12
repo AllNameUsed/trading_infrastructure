@@ -124,6 +124,16 @@ def fills_from_my_trades(trades: List[Dict[str, Any]], client_order_id: str) -> 
     )
 
 
+def balances_from_account(data: Dict[str, Any]) -> Dict[str, float]:
+    """Parses GET /api/v3/account: {asset: free + locked}, zero balances dropped."""
+    out: Dict[str, float] = {}
+    for b in data.get("balances", []):
+        total = float(b.get("free", "0")) + float(b.get("locked", "0"))
+        if total:
+            out[b["asset"]] = total
+    return out
+
+
 def error_message(data: Any) -> Optional[str]:
     if isinstance(data, dict) and "msg" in data:
         return f"[{data.get('code')}] {data['msg']}"

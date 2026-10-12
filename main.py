@@ -5,10 +5,13 @@ The only file that knows the concrete world (which venues, which strategies,
 which keys). It constructs every component, wires them, runs the startup
 sequence, and guarantees an orderly shutdown. It contains no business logic.
 
-Startup:  store -> instruments (exchangeInfo) -> gap healing -> warm-up ->
-          venues -> OMS -> bus -> quote stream -> feed
-Shutdown: feeds off -> in-flight venue calls drained -> bus drained ->
+Startup:  store (migrate) -> instruments (exchangeInfo) -> gap healing -> warm-up ->
+          venues -> REHYDRATION (halts, ledgers, sim balances, working orders, locks,
+          OPM, venue check, drawdown books) -> kill switch -> OMS -> bus -> quotes -> feed
+Shutdown: feeds off -> kill switch off -> in-flight venue calls drained -> bus drained ->
           venues closed -> store flushed (ALWAYS, including Ctrl+C on Windows)
+Restarting with open positions is supported: rehydration resumes them (the kill switch
+latch, if any, survives too).
 """
 
 import asyncio
@@ -34,6 +37,7 @@ from messages.model import ExecutionMode
 from ops.journal import DatabaseJournal
 from opm.lock import LockManager
 from opm.manager import OpenPositionManager
+from risk.kill_switch import KillSwitchController
 from risk.pretrade import (
     DuplicateIntentRule,
     FatFingerRule,
@@ -41,7 +45,9 @@ from risk.pretrade import (
     PreTradeRiskManager,
     RandomMockRejectionRule,
 )
+from risk.supervisor import RiskSupervisor
 from state.portfolio import PortfolioManager
+from state.rehydration import Rehydrator
 from state.stores import SqliteStore
 from strategies.mock_strat import MockStrat
 
@@ -109,7 +115,7 @@ async def main() -> None:
     portfolio = PortfolioManager(bus, instruments, store)
     lock_manager = LockManager(bus, position_view=portfolio.get_position)
     processor = DataProcessor(bus, active_assets=set(symbols), max_lookback=settings.MAX_LOOKBACK)
-    OpenPositionManager(bus, lock_manager)
+    opm = OpenPositionManager(bus, lock_manager)
     risk_manager = PreTradeRiskManager(rules=[
         FatFingerRule(max_notional_value=settings.RISK_MAX_ORDER_NOTIONAL),
         MinNotionalRule(min_notional=5.0),
@@ -120,6 +126,20 @@ async def main() -> None:
         bus=bus, store=store, router=router, strategy_registry=settings.STRATEGY_REGISTRY,
         risk_manager=risk_manager, instruments=instruments,
         market_view=processor.get_latest_market_state, position_view=portfolio.get_position,
+    )
+    kill_switch = KillSwitchController(
+        bus, store, oms=oms, portfolio=portfolio, lock=lock_manager, router=router, instruments=instruments,
+        market_view=processor.get_latest_market_state, modes=modes,
+        control_path=settings.KILL_SWITCH_CONTROL_FILE, status_path=settings.KILL_SWITCH_STATUS_FILE,
+        poll_seconds=settings.KILL_SWITCH_POLL_SECONDS,
+        flatten_retry_seconds=settings.KILL_SWITCH_FLATTEN_RETRY_SECONDS,
+    )
+    oms.halt_view = kill_switch.level          # the OMS entry gate (the two depend on each other)
+    supervisor = RiskSupervisor(
+        bus, store, pnl_at_cost=portfolio.pnl_at_cost, market_view=processor.get_latest_market_state,
+        kill_switch=kill_switch, capital={m: settings.RISK_CAPITAL[m] for m in modes},
+        window_hours=settings.RISK_DRAWDOWN_WINDOW_HOURS, max_drawdown_window=settings.RISK_MAX_DRAWDOWN_WINDOW,
+        max_drawdown_hwm=settings.RISK_MAX_DRAWDOWN_HWM,
     )
     strategies = [
         MockStrat(bus=bus, lock_manager=lock_manager, strategy_id=settings.MOCK_STRAT_ID, symbols=["ETHUSDT"]),
@@ -149,10 +169,17 @@ async def main() -> None:
     await warmup.warm(processor, symbols)
 
     # ----------------------------------------------------------------
-    # 5. Run
+    # 5. Rehydrate (venues up, bus not yet running: nothing acts on half-restored state)
     # ----------------------------------------------------------------
     for venue in router.all():
         await venue.start()
+    await Rehydrator(store, portfolio=portfolio, oms=oms, lock=lock_manager, opm=opm, router=router,
+                     instruments=instruments, kill_switch=kill_switch, supervisor=supervisor).run()
+
+    # ----------------------------------------------------------------
+    # 6. Run
+    # ----------------------------------------------------------------
+    await kill_switch.start()       # reads config/kill_switch.ini before the first bar
     await oms.start()
 
     feed = BinanceFeed(bus, symbols, timeframe=settings.BAR_INTERVAL, rest=rest,
@@ -182,16 +209,17 @@ async def main() -> None:
         # Windows Ctrl+C: asyncio.run cancels this task - fall through to cleanup.
         logger.warning("Interrupt received. Shutting down gracefully...")
     finally:
-        await shutdown(feed, quotes, oms, bus, router, rest, store, tasks)
+        await shutdown(feed, quotes, kill_switch, oms, bus, router, rest, store, tasks)
 
 
-async def shutdown(feed, quotes, oms, bus, router, rest, store, tasks) -> None:
+async def shutdown(feed, quotes, kill_switch, oms, bus, router, rest, store, tasks) -> None:
     """Orderly stop. Resting venue orders are deliberately left alone; the store is ALWAYS flushed."""
     logger.warning("Shutting down: feeds off, resting orders left untouched at the venue, state flushed.")
     feed.stop()
     if quotes is not None:
         quotes.stop()
     try:
+        await kill_switch.stop()    # an active halt stays latched in the store and resumes on restart
         await oms.stop(timeout=10.0)
         try:
             await asyncio.wait_for(bus.drain(), timeout=10.0)

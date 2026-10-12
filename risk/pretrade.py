@@ -14,6 +14,9 @@ Design notes:
   * Exits are treated differently from entries: an exit reduces risk, so only
     rules that declare `applies_to_exits = True` are run on them. Blocking a
     stop-out with a random or notional rule is how small losses become large.
+  * FLATTEN (the kill switch liquidating) runs NO rule at all: a kill switch a
+    risk rule can block is not a kill switch. The OMS still clamps it to the
+    position (reduce-only), so it can never oversize.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from messages.model import Intent, OrderRequest, OrderType
+from messages.model import Intent, IntentKind, OrderRequest, OrderType
 
 logger = logging.getLogger("PreTradeRisk")
 
@@ -156,7 +159,7 @@ class PreTradeRiskManager:
     Runs the rule chain for the OMS (step 6 of the intent pipeline).
       rules                                   evaluated in list order
       validate(intent, request, state) -> RiskVerdict   first rejection wins; exits run
-                                              only rules with applies_to_exits=True
+                                              only rules with applies_to_exits=True; FLATTEN runs none
     Pure and synchronous: no bus, no I/O. Publishing the outcome is the OMS's job.
     """
     def __init__(self, rules: List[RiskRule]):
@@ -164,6 +167,8 @@ class PreTradeRiskManager:
 
     def validate(self, intent: Intent, request: OrderRequest, market_state: dict) -> RiskVerdict:
         """First rejection wins. Pure: no I/O, no publishing."""
+        if intent.kind is IntentKind.FLATTEN:
+            return APPROVED
         for rule in self.rules:
             if intent.kind.is_exit and not rule.applies_to_exits:
                 continue

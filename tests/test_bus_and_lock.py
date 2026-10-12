@@ -5,7 +5,7 @@ import unittest
 
 from bus.event_bus import EventBus
 from messages.events import Event, Heartbeat, IntentRejected, KillSwitch
-from messages.model import IntentKind, OrderSide, RejectStage
+from messages.model import ExecutionMode, HaltLevel, IntentKind, OrderSide, RejectStage
 from opm.lock import LockManager, LockState
 from tests.helpers import STRAT, intent
 
@@ -18,7 +18,8 @@ class BusTests(unittest.IsolatedAsyncioTestCase):
         bus.subscribe(KillSwitch, lambda e: seen.append(("kill", e.reason)))
         for i in range(50):
             await bus.publish(Heartbeat(source="t", sequence=i))
-        await bus.publish(KillSwitch(source="t", reason="x"))
+        await bus.publish(KillSwitch(mode=ExecutionMode.SIM, level=HaltLevel.HALT_COMPLETE,
+                                     previous_level=HaltLevel.NONE, halt_id="h", source="t", reason="x"))
         task = asyncio.create_task(bus.run())
         await bus.drain()
         bus.stop()

@@ -15,10 +15,6 @@ from messages.model import IntentKind
 
 BASE62_ALPHABET = string.digits + string.ascii_letters
 _ALLOWED = re.compile(r"[^A-Za-z0-9_\-]")
-_KIND_CODE = {
-    IntentKind.OPEN: "O", IntentKind.CLOSE: "C", IntentKind.SCALE_IN: "I",
-    IntentKind.SCALE_OUT: "U", IntentKind.FLATTEN: "F",
-}
 
 
 def _base62(num: int) -> str:
@@ -32,4 +28,4 @@ def _base62(num: int) -> str:
 def generate_client_order_id(strategy_id: str, kind: IntentKind) -> str:
     """e.g. 'MOCK_STRAT.O.4Sn2OBJx3BcaEaBattmMo9' (prefix = first 10 allowed chars of the strategy id)."""
     prefix = _ALLOWED.sub("", strategy_id)[:10] or "S"
-    return f"{prefix}.{_KIND_CODE.get(kind, 'X')}.{_base62(uuid.uuid4().int)}"
+    return f"{prefix}.{kind.code}.{_base62(uuid.uuid4().int)}"

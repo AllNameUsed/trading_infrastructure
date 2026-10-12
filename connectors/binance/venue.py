@@ -25,7 +25,7 @@ import hashlib
 import hmac
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -33,6 +33,7 @@ import aiohttp
 from connectors.base import UpdateHandler, VenueUnknownOutcome
 from connectors.binance.codec import (
     VENUE_ID,
+    balances_from_account,
     error_message,
     fills_from_my_trades,
     update_from_order_response,
@@ -73,12 +74,14 @@ class BinanceVenue:
         cancel(...)   DELETE /api/v3/order         -> CANCELED update | None (unknown -> OMS queries)
         query(...)    GET /api/v3/order (+ GET /api/v3/myTrades when executedQty > 0 for exact fills/fees)
                       -> update | None on -2011/-2013 "order does not exist"
+        fetch_balances()  GET /api/v3/account -> {asset: free + locked}   (raises on failure)
     Outcome classification: 200 -> parse; 4xx -> REJECTED; 5xx / timeout / mid-flight
     disconnect -> VenueUnknownOutcome; connect failure / throttle -> REJECTED (not sent).
     needs_polling = True: no user-data stream yet; the OMS polls working orders.
     """
     venue_id = VENUE_ID
     needs_polling = True
+    survives_restart = True       # the exchange keeps our orders and balances while we are down
 
     def __init__(self, api_key: str, api_secret: str, mode: ExecutionMode, instruments: InstrumentRegistry,
                  request_timeout: float = 10.0, weight_limit: int = 5000, recv_window: int = 5000):
@@ -229,6 +232,16 @@ class BinanceVenue:
                     cumulative_filled_quantity=update.cumulative_filled_quantity,
                 )
         return update
+
+    async def fetch_balances(self) -> Dict[str, float]:
+        """Whole-account totals. Raises on any failure: callers must not mistake 'unknown' for 'empty'."""
+        try:
+            status, data = await self._signed("GET", "/api/v3/account", {})
+        except _Throttled as e:
+            raise RuntimeError(str(e)) from e
+        if status != 200 or not isinstance(data, dict):
+            raise RuntimeError(f"Account query failed: {error_message(data) or status}")
+        return balances_from_account(data)
 
     @staticmethod
     def _rejected(request: OrderRequest, reason: str) -> VenueOrderUpdate:

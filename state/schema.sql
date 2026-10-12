@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS intents (
     stop_price   REAL,
     reason       TEXT,
     outcome      TEXT,              -- NULL until resolved: ORDERED / REJECTED:<stage>
-    outcome_detail TEXT
+    outcome_detail TEXT,
+    reference_price REAL            -- decision price (v4): lets rehydration rebuild the Intent
 );
 
 -- 3. OMS Order Tracking (single writer: the OMS)
@@ -154,3 +155,55 @@ CREATE TABLE IF NOT EXISTS trade_fills (
     PRIMARY KEY (trade_id, client_order_id, exchange_trade_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_fills_fill ON trade_fills(client_order_id, exchange_trade_id);
+
+-- 9. Kill-switch episodes (single writer: the KillSwitchController, risk/kill_switch.py)
+--    One row per episode and execution mode; escalated in place; cleared_at stays NULL
+--    until the operator quotes halt_id in config/kill_switch.ini.
+CREATE TABLE IF NOT EXISTS halts (
+    halt_id      TEXT PRIMARY KEY,
+    mode         TEXT    NOT NULL,
+    level        TEXT    NOT NULL,   -- HALT_ENTRIES / HALT_COMPLETE (highest reached)
+    source       TEXT    NOT NULL,   -- manual / drawdown_window / drawdown_hwm / rehydration / breach:<rule>
+    reason       TEXT    NOT NULL,
+    triggered_at INTEGER NOT NULL,
+    escalated_at INTEGER,
+    flattened_at INTEGER,            -- HALT_COMPLETE: no system exposure or working order left
+    cleared_at   INTEGER,            -- NULL while active
+    clear_detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_halts_mode ON halts(mode, cleared_at);
+
+-- 10. PnL per (mode, strategy, symbol), sampled on every live bar close of the symbol
+--     (single writer: the RiskSupervisor, risk/supervisor.py). Cumulative since inception.
+CREATE TABLE IF NOT EXISTS strategy_pnl (
+    timestamp       INTEGER NOT NULL,
+    mode            TEXT    NOT NULL,
+    strategy_id     TEXT    NOT NULL,
+    symbol          TEXT    NOT NULL,
+    position_qty    REAL    NOT NULL,   -- ledger, sub-lot residual included
+    avg_entry_price REAL    NOT NULL,
+    mark_price      REAL,
+    realized_pnl    REAL    NOT NULL,   -- net of fees
+    unrealized_pnl  REAL    NOT NULL,
+    total_pnl       REAL    NOT NULL,
+    fees_paid       REAL    NOT NULL,
+    closed_trades   INTEGER NOT NULL,
+    winning_trades  INTEGER NOT NULL,
+    PRIMARY KEY (mode, strategy_id, symbol, timestamp)
+) WITHOUT ROWID;
+
+-- 11. Book equity per execution mode, sampled on every live bar close (single writer: the
+--     RiskSupervisor). Drawdowns are fractions: 0.05 = 5 %.
+CREATE TABLE IF NOT EXISTS portfolio_equity (
+    timestamp       INTEGER NOT NULL,
+    mode            TEXT    NOT NULL,
+    capital         REAL    NOT NULL,
+    total_pnl       REAL    NOT NULL,
+    equity          REAL    NOT NULL,
+    peak_window     REAL    NOT NULL,
+    high_watermark  REAL    NOT NULL,
+    drawdown_window REAL    NOT NULL,
+    drawdown_hwm    REAL    NOT NULL,
+    halt_level      TEXT    NOT NULL,
+    PRIMARY KEY (mode, timestamp)
+) WITHOUT ROWID;

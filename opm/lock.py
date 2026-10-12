@@ -28,6 +28,10 @@ Release rules (never guesses, only reacts to terminal facts):
   settle() derives the resting state from facts:
     has position -> HOLDING; working orders remain -> PENDING_ENTRY; else IDLE.
 
+Restart rehydration (`rehydrate`, startup only): the state is DERIVED from the
+rehydrated facts with the same rule as settle(): an exit order working -> PENDING_EXIT;
+a position -> HOLDING; an entry order working -> PENDING_ENTRY; otherwise IDLE.
+
 Position facts come from the PortfolioManager (`position_view`), the single
 writer of positions. It handles fill events BEFORE the lock (order=-50 vs -40)
 and applies them synchronously, so when a filled entry order settles the lock,
@@ -40,10 +44,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from messages.events import IntentIssued, IntentRejected, OrderEvent, PositionClosed, PositionOpened
-from messages.model import Intent, Position
+from messages.model import Intent, OrderSnapshot, Position
 
 logger = logging.getLogger("PositionLock")
 
@@ -89,6 +93,7 @@ class LockManager:
         can_opm_manage(sid, sym)        HOLDING?
         try_begin_entry(intent) -> bool IDLE & no working orders & no position -> PENDING_ENTRY
         try_begin_exit(intent) -> bool  HOLDING -> PENDING_EXIT
+        rehydrate(positions, working_orders)   startup only, before the bus runs
     Caller contract: acquire with try_begin_* IMMEDIATELY before publishing the
     IntentIssued (no await in between); a False return means drop the intent.
     """
@@ -141,6 +146,25 @@ class LockManager:
         self._transition((intent.strategy_id, intent.symbol), slot, LockState.PENDING_EXIT, "exit acquired")
         slot.pending_intent_id = intent.intent_id
         return True
+
+    def rehydrate(self, positions: List[Position], working_orders: List[OrderSnapshot]) -> None:
+        """Startup only: derive every slot from the rehydrated positions and working orders."""
+        if self._slots:
+            raise RuntimeError("rehydrate() on a LockManager that is already in use")
+        for pos in positions:
+            slot = self._slot((pos.strategy_id, pos.symbol))
+            slot.has_position = True
+            self._transition((pos.strategy_id, pos.symbol), slot, LockState.HOLDING, "rehydrated position")
+        for snap in working_orders:
+            key = (snap.strategy_id, snap.request.symbol)
+            slot = self._slot(key)
+            slot.working.add(snap.client_order_id)
+            if snap.intent.kind.is_exit:
+                slot.pending_intent_id = snap.intent.intent_id
+                self._transition(key, slot, LockState.PENDING_EXIT, "rehydrated working exit order")
+            elif slot.state is LockState.IDLE:
+                slot.pending_intent_id = snap.intent.intent_id
+                self._transition(key, slot, LockState.PENDING_ENTRY, "rehydrated working entry order")
 
     # =================================================================
     # Observers

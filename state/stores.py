@@ -17,6 +17,8 @@ Concurrency model:
     upsert can never be overtaken by an earlier one.
   * Reads (startup/rehydration only) use short-lived separate connections;
     WAL allows them to run concurrently with the writer.
+  * Schema upgrades are explicit, additive migrations (MIGRATIONS), applied in
+    place at start(). A file from a version with no migration path aborts startup.
 """
 
 from __future__ import annotations
@@ -25,15 +27,39 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import aiosqlite
 
-from messages.model import Bar, Fill, Intent, OrderSnapshot, Position, TradeRecord
+from messages.model import (
+    Bar,
+    EquitySnapshot,
+    ExecutionMode,
+    Fill,
+    HaltLevel,
+    HaltRecord,
+    Intent,
+    IntentKind,
+    OrderRequest,
+    OrderSide,
+    OrderSnapshot,
+    OrderStatus,
+    OrderType,
+    Position,
+    StrategyPnL,
+    TimeInForce,
+    TradeRecord,
+)
 
 logger = logging.getLogger("SqliteStore")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# from_version -> statements run BEFORE schema.sql (which then creates any new tables).
+# Additive only, so history is kept. v3 -> v4: kill switch, per-strategy PnL, intent reference price.
+MIGRATIONS: Dict[int, List[str]] = {
+    3: ["ALTER TABLE intents ADD COLUMN reference_price REAL"],
+}
+_TERMINAL = ("FILLED", "CANCELED", "REJECTED", "EXPIRED")
 _DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 _WriteItem = Tuple[str, tuple, Optional[asyncio.Future]]
@@ -47,6 +73,10 @@ def to_ms(dt: datetime) -> int:
 
 def from_ms(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def _opt_ms(dt: Optional[datetime]) -> Optional[int]:
+    return to_ms(dt) if dt is not None else None
 
 
 class SchemaMismatchError(RuntimeError):
@@ -73,8 +103,13 @@ class SqliteStore:
         link_trade_fill(...)              PortfolioManager only; trade_fills (one row per fill leg)
         log_intent / resolve_intent       Journal inserts, OMS resolves ORDERED / REJECTED:<stage>
         log_risk_event                    risk_ledger rows (rejections, breaches)
+        save_halt(record)                 KillSwitchController only; halts upsert by halt_id (durable)
+        save_strategy_pnl / save_equity   RiskSupervisor only; time series (insert or replace)
     Reads (separate short-lived connections; startup only):
         get_recent_bars(sym, interval, limit) / get_bar_start_times(...) / get_latest_bar_time(...)
+        rehydration: get_latest_trades / get_trade_legs / get_open_position_rows /
+                     get_closed_trade_stats / get_closed_trades / get_working_orders (domain objects) /
+                     get_fills_for_mode / get_halts / get_equity_history / get_max_total_pnl
     """
     def __init__(self, db_path: str = "system.db", schema_path: str = _DEFAULT_SCHEMA, max_batch: int = 500):
         self.db_path = db_path
@@ -114,10 +149,16 @@ class SqliteStore:
             async with db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='klines';") as cur:
                 (has_tables,) = await cur.fetchone()  # type: ignore[misc]
             if has_tables and version != SCHEMA_VERSION:
-                raise SchemaMismatchError(
-                    f"{self.db_path} was created by schema v{version}, this build needs v{SCHEMA_VERSION}. "
-                    f"Archive the file (it holds your history) and restart to create a fresh one."
-                )
+                if version not in MIGRATIONS:
+                    raise SchemaMismatchError(
+                        f"{self.db_path} was created by schema v{version}, this build needs v{SCHEMA_VERSION} "
+                        f"and has no migration from it. Archive the file (it holds your history) and restart."
+                    )
+                while version != SCHEMA_VERSION:
+                    for statement in MIGRATIONS[version]:
+                        await db.execute(statement)
+                    logger.warning(f"Migrated {self.db_path}: schema v{version} -> v{version + 1} (history kept).")
+                    version += 1
             with open(self.schema_path, "r", encoding="utf-8") as f:
                 await db.executescript(f.read())
             await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -290,11 +331,11 @@ class SqliteStore:
     async def log_intent(self, intent: Intent) -> None:
         await self._write(
             """INSERT OR IGNORE INTO intents (intent_id, created_at, strategy_id, symbol, venue, kind, side,
-                   order_type, quantity, price, stop_price, reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   order_type, quantity, price, stop_price, reason, reference_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (intent.intent_id, to_ms(intent.created_at), intent.strategy_id, intent.symbol, intent.venue,
              intent.kind.name, intent.side.name, intent.order_type.name, intent.quantity,
-             intent.price, intent.stop_price, intent.reason),
+             intent.price, intent.stop_price, intent.reason, intent.reference_price),
         )
 
     async def resolve_intent(self, intent_id: str, outcome: str, detail: str = "") -> None:
@@ -310,9 +351,151 @@ class SqliteStore:
             (to_ms(timestamp), rule_name, symbol, action, detail),
         )
 
+    async def save_halt(self, h: HaltRecord) -> None:
+        await self._write(
+            """INSERT INTO halts (halt_id, mode, level, source, reason, triggered_at, escalated_at,
+                   flattened_at, cleared_at, clear_detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(halt_id) DO UPDATE SET
+                 level=excluded.level, escalated_at=excluded.escalated_at, flattened_at=excluded.flattened_at,
+                 cleared_at=excluded.cleared_at, clear_detail=excluded.clear_detail""",
+            (h.halt_id, h.mode.value, h.level.name, h.source, h.reason, to_ms(h.triggered_at),
+             _opt_ms(h.escalated_at), _opt_ms(h.flattened_at), _opt_ms(h.cleared_at), h.clear_detail),
+            durable=True,   # a halt must be on disk before anything relies on it
+        )
+
+    async def save_strategy_pnl(self, r: StrategyPnL) -> None:
+        await self._write(
+            """INSERT OR REPLACE INTO strategy_pnl (timestamp, mode, strategy_id, symbol, position_qty,
+                   avg_entry_price, mark_price, realized_pnl, unrealized_pnl, total_pnl, fees_paid,
+                   closed_trades, winning_trades)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (to_ms(r.timestamp), r.mode.value, r.strategy_id, r.symbol, r.position_qty, r.avg_entry_price,
+             r.mark_price, r.realized_pnl, r.unrealized_pnl, r.total_pnl, r.fees_paid,
+             r.closed_trades, r.winning_trades),
+        )
+
+    async def save_equity(self, e: EquitySnapshot) -> None:
+        await self._write(
+            """INSERT OR REPLACE INTO portfolio_equity (timestamp, mode, capital, total_pnl, equity,
+                   peak_window, high_watermark, drawdown_window, drawdown_hwm, halt_level)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (to_ms(e.timestamp), e.mode.value, e.capital, e.total_pnl, e.equity, e.peak_window,
+             e.high_watermark, e.drawdown_window, e.drawdown_hwm, e.halt_level.name),
+        )
+
     # =================================================================
     # Reads (startup / rehydration only)
     # =================================================================
+    async def _fetch(self, query: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_latest_trades(self) -> List[Dict[str, Any]]:
+        """The newest trade row of every ledger (strategy_id, symbol): the open one, or the last closed."""
+        return await self._fetch(
+            """SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY strategy_id, symbol
+                                ORDER BY entry_time DESC, rowid DESC) AS rn FROM trades t)
+               WHERE rn = 1""")
+
+    async def get_trade_legs(self, trade_id: str) -> List[Dict[str, Any]]:
+        """A trade's fill legs in the order they were applied (leg quantity/fee + the fill's columns)."""
+        return await self._fetch(
+            """SELECT l.quantity AS leg_quantity, l.fee AS leg_fee, f.*
+               FROM trade_fills l JOIN fills f USING (client_order_id, exchange_trade_id)
+               WHERE l.trade_id = ? ORDER BY l.rowid""", (trade_id,))
+
+    async def get_open_position_rows(self) -> List[Dict[str, Any]]:
+        return await self._fetch("SELECT * FROM positions WHERE status = 'OPEN'")
+
+    async def get_closed_trade_stats(self) -> List[Dict[str, Any]]:
+        """Per (mode, strategy, symbol): closed-trade count, winners, realized PnL and fees."""
+        return await self._fetch(
+            """SELECT mode, strategy_id, symbol, COUNT(*) AS closed_trades,
+                      SUM(realized_pnl > 0) AS winning_trades,
+                      SUM(realized_pnl) AS realized_pnl, SUM(fees_paid) AS fees_paid
+               FROM trades WHERE status = 'CLOSED' GROUP BY mode, strategy_id, symbol""")
+
+    async def get_closed_trades(self) -> List[Dict[str, Any]]:
+        return await self._fetch(
+            "SELECT strategy_id, realized_pnl FROM trades WHERE status = 'CLOSED' ORDER BY exit_time, rowid")
+
+    async def get_working_orders(self) -> List[Tuple[OrderSnapshot, List[Fill], Optional[str]]]:
+        """
+        Every non-terminal order as its last persisted snapshot (Intent rebuilt) plus its fills so far,
+        and a problem string when its intent row is missing. Such an order is still returned - rebuilt
+        from the order row, kind from its client order id - so it can never silently drop out of
+        rehydration; the problem halts entries instead.
+        """
+        rows = await self._fetch(
+            f"""SELECT o.*, i.created_at AS intent_created_at, i.kind, i.quantity AS intent_quantity,
+                       i.price AS intent_price, i.stop_price AS intent_stop_price, i.reason,
+                       i.reference_price, i.venue AS intent_venue
+                FROM orders o LEFT JOIN intents i USING (intent_id)
+                WHERE o.status NOT IN {_TERMINAL} ORDER BY o.created_at""")
+        out: List[Tuple[OrderSnapshot, List[Fill], Optional[str]]] = []
+        for r in rows:
+            side, order_type = OrderSide[r["side"]], OrderType[r["order_type"]]
+            tif = TimeInForce(r["time_in_force"])
+            problem = None
+            if r["intent_created_at"] is not None:
+                kind = IntentKind[r["kind"]]
+                intent_fields = dict(venue=r["intent_venue"], quantity=r["intent_quantity"], price=r["intent_price"],
+                                     stop_price=r["intent_stop_price"], reason=r["reason"] or "",
+                                     reference_price=r["reference_price"], created_at=from_ms(r["intent_created_at"]))
+            else:
+                parts = r["client_order_id"].split(".")
+                kind = IntentKind.from_code(parts[1]) if len(parts) == 3 else None
+                problem = (f"order {r['client_order_id']}: intent {r['intent_id']} is missing from the journal; "
+                           f"rebuilt from the order row as {kind.name if kind else 'OPEN (kind unknown)'}")
+                kind = kind or IntentKind.OPEN
+                intent_fields = dict(venue=r["venue"], quantity=r["quantity"], price=r["price"],
+                                     stop_price=r["stop_price"], reason="rehydrated without an intent row",
+                                     reference_price=None, created_at=from_ms(r["created_at"]))
+            intent = Intent(strategy_id=r["strategy_id"], symbol=r["symbol"], kind=kind, side=side,
+                            order_type=order_type, time_in_force=tif, intent_id=r["intent_id"], **intent_fields)
+            request = OrderRequest(
+                client_order_id=r["client_order_id"], symbol=r["symbol"], venue=r["venue"], side=side,
+                order_type=order_type, quantity=r["quantity"], price=r["price"], stop_price=r["stop_price"],
+                time_in_force=tif)
+            snap = OrderSnapshot(
+                client_order_id=r["client_order_id"], strategy_id=r["strategy_id"], mode=ExecutionMode(r["mode"]),
+                intent=intent, request=request, status=OrderStatus[r["status"]],
+                filled_quantity=r["filled_quantity"], average_price=r["average_price"],
+                cumulative_fee=r["cumulative_fee"], venue_order_id=r["venue_order_id"], version=r["version"],
+                created_at=from_ms(r["created_at"]), updated_at=from_ms(r["updated_at"]))
+            fills = [self._row_to_fill(f) for f in await self._fetch(
+                "SELECT * FROM fills WHERE client_order_id = ? ORDER BY rowid", (r["client_order_id"],))]
+            out.append((snap, fills, problem))
+        return out
+
+    async def get_fills_for_mode(self, mode: ExecutionMode) -> List[Fill]:
+        """Every recorded fill of orders routed to `mode`, in recording order."""
+        return [self._row_to_fill(r) for r in await self._fetch(
+            """SELECT f.* FROM fills f JOIN orders o USING (client_order_id)
+               WHERE o.mode = ? ORDER BY f.rowid""", (mode.value,))]
+
+    async def get_halts(self) -> List[HaltRecord]:
+        """Every kill-switch episode, oldest first (cleared_at None = still active)."""
+        opt = lambda ms: from_ms(ms) if ms is not None else None   # noqa: E731
+        return [HaltRecord(halt_id=r["halt_id"], mode=ExecutionMode(r["mode"]), level=HaltLevel[r["level"]],
+                           source=r["source"], reason=r["reason"], triggered_at=from_ms(r["triggered_at"]),
+                           escalated_at=opt(r["escalated_at"]), flattened_at=opt(r["flattened_at"]),
+                           cleared_at=opt(r["cleared_at"]), clear_detail=r["clear_detail"])
+                for r in await self._fetch("SELECT * FROM halts ORDER BY triggered_at, rowid")]
+
+    async def get_max_total_pnl(self, mode: ExecutionMode, since_ms: int) -> Optional[float]:
+        """Highest book PnL recorded since `since_ms` (the high-water mark's seed), or None."""
+        rows = await self._fetch("SELECT MAX(total_pnl) AS m FROM portfolio_equity WHERE mode = ? AND timestamp >= ?",
+                                 (mode.value, since_ms))
+        return rows[0]["m"] if rows and rows[0]["m"] is not None else None
+
+    async def get_equity_history(self, mode: ExecutionMode, since_ms: int) -> List[Dict[str, Any]]:
+        return await self._fetch(
+            "SELECT timestamp, total_pnl FROM portfolio_equity WHERE mode = ? AND timestamp >= ? "
+            "ORDER BY timestamp", (mode.value, since_ms))
     async def get_recent_bars(self, symbol: str, interval: str, limit: int) -> List[Bar]:
         query = """SELECT symbol, interval, start_time, close_time, open, high, low, close, volume
                    FROM klines WHERE symbol = ? AND interval = ?
@@ -336,6 +519,13 @@ class SqliteStore:
             async with db.execute(query, (symbol, interval)) as cursor:
                 row = await cursor.fetchone()
         return int(row[0]) if row and row[0] is not None else None
+
+    @staticmethod
+    def _row_to_fill(r: Dict[str, Any]) -> Fill:
+        return Fill(client_order_id=r["client_order_id"], strategy_id=r["strategy_id"], intent_id=r["intent_id"],
+                    symbol=r["symbol"], side=OrderSide[r["side"]], quantity=r["quantity"], price=r["price"],
+                    fee=r["fee"], fee_asset=r["fee_asset"], is_maker=bool(r["is_maker"]),
+                    exchange_trade_id=r["exchange_trade_id"], timestamp=from_ms(r["timestamp"]))
 
     @staticmethod
     def _row_to_bar(r) -> Bar:
